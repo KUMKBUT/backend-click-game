@@ -1,0 +1,200 @@
+# ─── REDIS ────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        command:
+          - redis-server
+          - --maxmemory
+          - "512mb"
+          - --maxmemory-policy
+          - allkeys-lru
+          - --tcp-backlog
+          - "511"
+          - --hz
+          - "20"
+          - --lazyfree-lazy-eviction
+          - "yes"
+          - --lazyfree-lazy-expire
+          - "yes"
+          - --lazyfree-lazy-server-del
+          - "yes"
+          - --activerehashing
+          - "yes"
+          - --save
+          - ""
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "768Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+---
+# ─── POSTGRES ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: "postgres-service"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        args:
+          - -c
+          - max_connections=200
+          - -c
+          - shared_buffers=256MB
+          - -c
+          - work_mem=8MB
+          - -c
+          - wal_buffers=16MB
+          - -c
+          - checkpoint_completion_target=0.9
+          - -c
+          - effective_cache_size=1GB
+          - -c
+          - synchronous_commit=off
+          - -c
+          - random_page_cost=1.1
+          - -c
+          - effective_io_concurrency=200
+          # fsync=off — для k3d/local тестирования ТОЛЬКО
+          # Данные могут быть потеряны при краше ноды, но скорость x5-10
+          - -c
+          - fsync=off
+          - -c
+          - full_page_writes=off
+        env:
+        - name: POSTGRES_USER
+          value: "sasha_dev"
+        - name: POSTGRES_PASSWORD
+          value: "secure_pass_123"
+        - name: POSTGRES_DB
+          value: "game_db"
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+---
+# ─── PGBOUNCER ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      containers:
+      - name: pgbouncer
+        image: edoburu/pgbouncer:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5432
+        env:
+        - name: DB_USER
+          value: "sasha_dev"
+        - name: DB_PASSWORD
+          value: "secure_pass_123"
+        - name: DB_HOST
+          value: "postgres-service"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_NAME
+          value: "game_db"
+        - name: POOL_MODE
+          value: "transaction"
+        - name: MAX_CLIENT_CONN
+          value: "5000"
+        - name: DEFAULT_POOL_SIZE
+          value: "80"
+        - name: MIN_POOL_SIZE
+          value: "20"
+        - name: RESERVE_POOL_SIZE
+          value: "20"
+        - name: RESERVE_POOL_TIMEOUT
+          value: "2"
+        - name: SERVER_IDLE_TIMEOUT
+          value: "300"
+        # Убираем query_timeout — он убивал запросы при нагрузке
+        - name: QUERY_TIMEOUT
+          value: "0"
+        - name: CLIENT_IDLE_TIMEOUT
+          value: "0"
+        - name: SERVER_CONNECT_TIMEOUT
+          value: "10"
+        - name: AUTH_TYPE
+          value: "plain"
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "64Mi"
+          limits:
+            cpu: "1000m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer-service
+spec:
+  selector:
+    app: pgbouncer
+  ports:
+    - port: 5432

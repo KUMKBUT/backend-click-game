@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rust-app-service
+spec:
+  selector:
+    app: clicker-backend
+  ports:
+    - protocol: TCP
+      port: 3719
+      targetPort: 3719
+      nodePort: 30500
+  type: NodePort
