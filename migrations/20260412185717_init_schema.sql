@@ -9,3 +9,10 @@ CREATE TABLE IF NOT EXISTS "user" (
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_token ON "user"(token);
+
+CREATE TABLE user_upgrades (
+    user_id BIGINT REFERENCES "user"(id) ON DELETE CASCADE,
+    upgrade_id TEXT NOT NULL,
+    level INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, upgrade_id)
+);

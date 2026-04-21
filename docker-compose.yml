@@ -6,34 +6,13 @@ services:
     ports:
       - "3719:3719"
     environment:
-      - DATABASE_URL=postgres://sasha_dev:secure_pass_123@pgbouncer:5432/game_db
+      - DATABASE_URL=postgres://sasha_dev:secure_pass_123@db:5432/game_db
       - REDIS_URL=redis://redis:6379
-      - DB_POOL_SIZE=20
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_started
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 512M
-
-  pgbouncer:
-    image: bitnami/pgbouncer:latest
-    environment:
-      - POSTGRESQL_HOST=db
-      - POSTGRESQL_PORT=5432
-      - POSTGRESQL_USERNAME=sasha_dev
-      - POSTGRESQL_PASSWORD=secure_pass_123
-      - POSTGRESQL_DATABASE=game_db
-      - PGBOUNCER_POOL_MODE=transaction
-      - PGBOUNCER_MAX_CLIENT_CONN=2000
-      - PGBOUNCER_DEFAULT_POOL_SIZE=50
-    depends_on:
-      db:
-        condition: service_healthy
 
   db:
     image: postgres:16-alpine
@@ -42,55 +21,23 @@ services:
       - POSTGRES_USER=sasha_dev
       - POSTGRES_PASSWORD=secure_pass_123
       - POSTGRES_DB=game_db
-    command:
-      - postgres
-      - -c
-      - max_connections=200
-      - -c
-      - shared_buffers=256MB
-      - -c
-      - synchronous_commit=off
-      - -c
-      - work_mem=4MB
-      - -c
-      - wal_buffers=16MB
-      - -c
-      - checkpoint_completion_target=0.9
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      # Исправлен баг: правильный user и dbname из env
       test: ["CMD-SHELL", "pg_isready -U sasha_dev -d game_db"]
       interval: 5s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 1G
 
   redis:
     image: redis:7-alpine
     restart: always
-    command:
-      - redis-server
-      - --maxmemory 512mb
-      - --maxmemory-policy allkeys-lru
-      - --save ""
-      - --hz 20
-      - --lazyfree-lazy-expire yes
     ports:
       - "6379:6379"
     volumes:
       - redisdata:/data
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 768M
 
 volumes:
   pgdata:

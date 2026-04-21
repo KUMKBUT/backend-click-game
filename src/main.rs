@@ -1,9 +1,9 @@
 use axum::{Json, Router, extract::State, http::{HeaderMap, StatusCode, header}, routing::{get, post}};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use serde::{Serialize, Deserialize};
 use redis::{aio::ConnectionManager, AsyncCommands};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::{sync::{CancellationToken}, task::{TaskTracker}};
 
 pub struct AppState {
     pub db: PgPool,
@@ -34,73 +34,55 @@ pub struct SyncResponse {
     pub last_sync: i64,
 }
 
-const MAX_CLICKS_PER_REQUEST: i64 = 100;
-const MAX_BALANCE: i64 = 1_000_000_000_000;
-const RATE_LIMIT_INTERVAL_MS: i64 = 500;
-const BLOCK_DURATION_SECS: u64 = 60;
-const RATE_LIMIT_TTL_SECS: u64 = 2;
-const USER_CACHE_TTL_SECS: u64 = 300;
-
-// ─── Rate limiting (один Lua round-trip) ──────────────────────────────────────
-
-async fn rate_limit_check(
-    redis: &mut ConnectionManager,
-    token: &str,
-) -> Result<(), (StatusCode, String)> {
-    let script = redis::Script::new(r#"
-        local blocked_key = KEYS[1]
-        local rl_key = KEYS[2]
-        local now = tonumber(ARGV[1])
-        local interval = tonumber(ARGV[2])
-        local block_ttl = tonumber(ARGV[3])
-        local rl_ttl = tonumber(ARGV[4])
-        if redis.call('EXISTS', blocked_key) == 1 then return -1 end
-        local last = redis.call('GET', rl_key)
-        if last then
-            if now - tonumber(last) < interval then
-                redis.call('SET', blocked_key, '1', 'EX', block_ttl)
-                return -2
-            end
-        end
-        redis.call('SET', rl_key, now, 'EX', rl_ttl)
-        return 1
-    "#);
-
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    let blocked_key = format!("blocked:{token}");
-    let rl_key = format!("rl:{token}");
-
-    let result: i64 = script
-        .key(&blocked_key).key(&rl_key)
-        .arg(now_ms).arg(RATE_LIMIT_INTERVAL_MS)
-        .arg(BLOCK_DURATION_SECS as i64).arg(RATE_LIMIT_TTL_SECS as i64)
-        .invoke_async(redis).await.unwrap_or(1);
-
-    match result {
-        -1 => Err((StatusCode::FORBIDDEN, "Token is blocked".into())),
-        -2 => Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests".into())),
-        _ => Ok(()),
-    }
+#[derive(Deserialize)]
+pub struct BuyUpgradePayload {
+    pub upgrade_id: String,
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────────────
+#[derive(Serialize, Clone)]
+pub struct UpgradeInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub upgrade_type: &'static str,
+    pub base_price: i64,
+    pub base_power: i64,
+    pub price_growth: f64,
+}
+
+// --- Защита от спама (Rate Limiting) ---
+async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: &str) -> Result<(), (StatusCode, String)> {
+    let blocked_key = format!("blocked:{}", token);
+    let rl_key = format!("rl:{}", token);
+
+    let is_blocked: bool = redis.exists(&blocked_key).await.unwrap_or(false);
+    if is_blocked {
+        return Err((StatusCode::FORBIDDEN, "Token is blocked for 15 minutes".into()));
+    }
+
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+    let last_req: Option<i64> = redis.get(&rl_key).await.unwrap_or(None);
+    if let Some(last) = last_req {
+        if now_ms - last < 1500 {
+            let _: () = redis.set_ex(&blocked_key, "1", 900).await.unwrap_or_default();
+            return Err((StatusCode::TOO_MANY_REQUESTS, "Spam detected. Blocked for 15 minutes".into()));
+        }
+    }
+
+    let _: () = redis.set_ex(&rl_key, now_ms, 2).await.unwrap_or_default();
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
     let redis_client = redis::Client::open(redis_url)?;
     let redis_manager = redis_client.get_connection_manager().await?;
-
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool_size: u32 = std::env::var("DB_POOL_SIZE")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set");
 
     let pool = PgPoolOptions::new()
-        .max_connections(pool_size)
-        .min_connections(5)
-        // Увеличиваем acquire_timeout — даём PgBouncer время найти слот
-        .acquire_timeout(Duration::from_secs(10))
-        .idle_timeout(Duration::from_secs(300))
+        .max_connections(50)
         .connect(&db_url)
         .await?;
 
@@ -109,92 +91,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracker = TaskTracker::new();
     let token = CancellationToken::new();
 
-    let shared_state = Arc::new(AppState { db: pool.clone(), redis: redis_manager.clone() });
+    let shared_state = Arc::new(AppState {
+        db: pool.clone(),
+        redis: redis_manager.clone(),
+    });
 
     let sync_db = pool.clone();
     let sync_redis = redis_manager.clone();
     let sync_token = token.clone();
-
+    
     tracker.spawn(async move {
         println!("🚀 Воркер синхронизации запущен");
         spawn_db_syncer(sync_db, sync_redis, sync_token).await;
     });
 
     let app = Router::new()
-        .route("/api/health", get(health_check))
         .route("/api/data", get(api_data_handler))
         .route("/api/click", post(api_click_handler))
         .route("/api/sync", post(api_sync_handler))
         .with_state(shared_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3719").await?;
-    println!("📡 Сервер слушает на 0.0.0.0:3719");
+    let addr = "0.0.0.0:3719";
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("📡 Сервер слушает на {}", addr);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(token.clone(), tracker.clone()))
+        .with_graceful_shutdown(shutdown_signal(token.clone(), tracker.clone())) // Добавлен tracker.clone()
         .await?;
 
     tracker.close();
     tracker.wait().await;
+    
     println!("Все данные сохранены. Бэкенд остановлен.");
     Ok(())
 }
 
-// ─── Получение пользователя ────────────────────────────────────────────────────
-// КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: при cache miss сначала пробуем GET из Redis-флага существования.
-// Только если пользователя точно нет — идём в БД за INSERT.
-// Это убирает лавину INSERT'ов при старте нагрузочного теста.
-
-async fn get_or_create_user(
-    db: &PgPool,
-    redis: &mut ConnectionManager,
-    token: &str,
-) -> Result<GameUser, (StatusCode, String)> {
-    // 1. Смотрим полный кэш пользователя
-    let cache_key = format!("user:{token}");
-    if let Ok(Some(data)) = redis.get::<_, Option<String>>(&cache_key).await {
-        if let Ok(user) = serde_json::from_str::<GameUser>(&data) {
-            return Ok(user);
-        }
-    }
-
-    // 2. Cache miss → идём в БД. UPSERT атомарен — нет гонки между репликами.
-    let now_sec = now_secs();
-    let user = sqlx::query_as::<_, GameUser>(
-        r#"INSERT INTO "user" (token, first_name, per_click, auto_click, balance, last_sync)
-           VALUES ($1, 'Player', 1, 0, 0, $2)
-           ON CONFLICT (token) DO UPDATE
-             SET last_sync = "user".last_sync
-           RETURNING id, token, first_name, per_click, auto_click, balance, last_sync"#,
-    )
-    .bind(token)
-    .bind(now_sec)
-    .fetch_one(db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // 3. Кладём в кэш
-    if let Ok(json) = serde_json::to_string(&user) {
-        let _: () = redis.set_ex(&cache_key, json, USER_CACHE_TTL_SECS).await.unwrap_or_default();
-    }
-    Ok(user)
-}
-
 async fn get_game_user(
-    db: &PgPool,
-    redis: &mut ConnectionManager,
-    token: &str,
+    db: &PgPool, 
+    redis: &mut redis::aio::ConnectionManager, 
+    token: &str
 ) -> Result<Option<GameUser>, (StatusCode, String)> {
-    let cache_key = format!("user:{token}");
-    if let Ok(Some(data)) = redis.get::<_, Option<String>>(&cache_key).await {
-        if let Ok(user) = serde_json::from_str::<GameUser>(&data) {
+    let cache_key = format!("user:{}", token);
+
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await {
+        if let Ok(user) = serde_json::from_str(&cached_data) {
             return Ok(Some(user));
         }
     }
 
     let user = sqlx::query_as::<_, GameUser>(
-        r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync
-           FROM "user" WHERE token = $1"#,
+        r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync FROM "user" WHERE token = $1"#
     )
     .bind(token)
     .fetch_optional(db)
@@ -202,16 +148,11 @@ async fn get_game_user(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if let Some(u) = &user {
-        if let Ok(json) = serde_json::to_string(u) {
-            let _: () = redis.set_ex(&cache_key, json, USER_CACHE_TTL_SECS).await.unwrap_or_default();
-        }
+        let json = serde_json::to_string(u).unwrap();
+        let _: () = redis.set_ex(&cache_key, json, 60).await.unwrap_or_default();
     }
     Ok(user)
 }
-
-async fn health_check() -> StatusCode { StatusCode::OK }
-
-// ─── GET /api/data ─────────────────────────────────────────────────────────────
 
 async fn api_data_handler(
     State(state): State<SharedState>,
@@ -220,174 +161,254 @@ async fn api_data_handler(
     let mut redis = state.redis.clone();
     let token = extract_token(&headers)?;
     rate_limit_check(&mut redis, token).await?;
-    // get_or_create: один запрос вместо GET + conditional INSERT
-    let user = get_or_create_user(&state.db, &mut redis, token).await?;
-    Ok(Json(user))
+
+    if let Some(user) = get_game_user(&state.db, &mut redis, token).await? {
+        return Ok(Json(user));
+    }
+
+    let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    
+    let new_user = sqlx::query_as::<_, GameUser>(
+        r#"
+        INSERT INTO "user" (token, first_name, per_click, auto_click, balance, last_sync)
+        VALUES ($1, 'Player', 1, 0, 0, $2)
+        RETURNING id, token, first_name, per_click, auto_click, balance, last_sync
+        "#
+    )
+    .bind(token)
+    .bind(now_sec)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let json = serde_json::to_string(&new_user).unwrap();
+    let _: () = redis.set_ex(format!("user:{}", token), json, 60).await.unwrap_or_default();
+
+    Ok(Json(new_user))
 }
 
-// ─── POST /api/click ───────────────────────────────────────────────────────────
+// Общая логика начисления баланса
+async fn process_clicks_and_sync(
+    state: &SharedState,
+    token: &str,
+    clicks_data: i64,
+) -> Result<Json<SyncResponse>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+    
+    rate_limit_check(&mut redis, token).await?;
 
+    let user = get_game_user(&state.db, &mut redis, token)
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
+
+    let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    
+    let actual_clicks = clicks_data.min(100); 
+    let time_diff = (now_sec - user.last_sync).max(0);
+
+    let total_earned = (actual_clicks * user.per_click) + (time_diff * user.auto_click);
+
+    let final_balance = user.balance + total_earned;
+    let final_sync_time = now_sec;
+
+    sqlx::query(r#"UPDATE "user" SET balance = $1, last_sync = $2 WHERE token = $3"#)
+        .bind(final_balance)
+        .bind(final_sync_time)
+        .bind(token)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB Error: {}", e)))?;
+
+    let _: () = redis.del(format!("user:{}", token)).await.unwrap_or_default();
+
+    Ok(Json(SyncResponse {
+        balance: final_balance,
+        last_sync: final_sync_time,
+    }))
+}
+
+async fn process_buy_upgrade(
+    state: &SharedState,
+    token: &str,
+    payload: BuyUpgradePayload,
+) -> Result<Json<GameUser>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+    
+    let config = get_upgrade_config(&payload.upgrade_id)
+        .ok_or((StatusCode::BAD_REQUEST, "Неверный ID апгрейда".into()))?;
+
+    let user = get_game_user(&state.db, &mut redis, token).await?
+        .ok_or((StatusCode::NOT_FOUND, "Пользователь не найден".into()))?;
+
+    let upgrade_row: (i32,) = sqlx::query_as("SELECT level FROM user_upgrades WHERE user_id = $1 AND upgrade_id = $2")
+        .bind(user.id)
+        .bind(&config.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .unwrap_or((0,));
+
+    let current_level = upgrade_row.0;
+
+    let price = (config.base_price as f64 * config.price_growth.powi(current_level)) as i64;
+
+    let mut tx = state.db.begin().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let update_result = sqlx::query(
+            "UPDATE \"user\" SET balance = balance - $1 WHERE id = $2 AND balance >= $1"
+        )
+        .bind(price)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if update_result.rows_affected() == 0 {
+        return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
+    }
+
+    sqlx::query(r#"
+        INSERT INTO user_upgrades (user_id, upgrade_id, level) 
+        VALUES ($1, $2, 1) 
+        ON CONFLICT (user_id, upgrade_id) DO UPDATE SET level = user_upgrades.level + 1
+    "#)
+    .bind(user.id)
+    .bind(&config.id)
+    .execute(&mut *tx).await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let field = if config.upgrade_type == "auto" { "auto_click" } else { "per_click" };
+    let update_stat_query = format!("UPDATE \"user\" SET {field} = {field} + $1 WHERE id = $2");
+    
+    sqlx::query(&update_stat_query)
+        .bind(config.base_power)
+        .bind(user.id)
+        .execute(&mut *tx).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let _: () = redis.del(format!("user:{}", token)).await.unwrap_or_default();
+
+    let updated_user = get_game_user(&state.db, &mut redis, token).await?
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Ошибка синхронизации".into()))?;
+
+    Ok(Json(updated_user))
+}
+
+pub fn get_upgrade_config(id: &str) -> Option<UpgradeInfo> {
+    match id {
+        // --- КАТЕГОРИЯ: GPU (Авто-майнинг) ---
+        "gpu_1" => Some(UpgradeInfo { id: "gpu_1", name: "GT 710", upgrade_type: "auto", base_price: 16, base_power: 1, price_growth: 1.6 }),
+        "gpu_2" => Some(UpgradeInfo { id: "gpu_2", name: "GTX 1050 Ti", upgrade_type: "auto", base_price: 256, base_power: 8, price_growth: 1.6 }),
+        "gpu_3" => Some(UpgradeInfo { id: "gpu_3", name: "RTX 2060 Super", upgrade_type: "auto", base_price: 4096, base_power: 64, price_growth: 1.6 }),
+        "gpu_4" => Some(UpgradeInfo { id: "gpu_4", name: "RTX 4070 Ti", upgrade_type: "auto", base_price: 65536, base_power: 512, price_growth: 1.6 }),
+        "gpu_5" => Some(UpgradeInfo { id: "gpu_5", name: "RTX 4090 OC", upgrade_type: "auto", base_price: 1048576, base_power: 4096, price_growth: 1.6 }),
+        "gpu_6" => Some(UpgradeInfo { id: "gpu_6", name: "Antminer S21 Pro", upgrade_type: "auto", base_price: 16777216, base_power: 32768, price_growth: 1.6 }),
+        "gpu_7" => Some(UpgradeInfo { id: "gpu_7", name: "RTX 5090 Ti Prototype", upgrade_type: "auto", base_price: 268435456, base_power: 262144, price_growth: 1.6 }),
+
+        // --- КАТЕГОРИЯ: CPU (Авто-майнинг премиум) ---
+        "cpu_1" => Some(UpgradeInfo { id: "cpu_1", name: "Intel Celeron", upgrade_type: "auto", base_price: 32, base_power: 1, price_growth: 1.6 }),
+        "cpu_2" => Some(UpgradeInfo { id: "cpu_2", name: "Core i3-10100", upgrade_type: "auto", base_price: 512, base_power: 8, price_growth: 1.6 }),
+        "cpu_3" => Some(UpgradeInfo { id: "cpu_3", name: "Core i7-13700K", upgrade_type: "auto", base_price: 8192, base_power: 64, price_growth: 1.6 }),
+        "cpu_4" => Some(UpgradeInfo { id: "cpu_4", name: "Ryzen 9 7950X", upgrade_type: "auto", base_price: 131072, base_power: 512, price_growth: 1.6 }),
+        "cpu_5" => Some(UpgradeInfo { id: "cpu_5", name: "Threadripper 3990X", upgrade_type: "auto", base_price: 2097152, base_power: 4096, price_growth: 1.6 }),
+        "cpu_6" => Some(UpgradeInfo { id: "cpu_6", name: "Quantum Cluster", upgrade_type: "auto", base_price: 33554432, base_power: 32768, price_growth: 1.6 }),
+        "cpu_7" => Some(UpgradeInfo { id: "cpu_7", name: "EPYC 9654 Farm", upgrade_type: "auto", base_price: 536870912, base_power: 262144, price_growth: 1.6 }),
+
+        // --- КАТЕГОРИЯ: MOUSE (Сила клика) ---
+        "mouse_1" => Some(UpgradeInfo { id: "mouse_1", name: "Офисная мышь", upgrade_type: "click", base_price: 64, base_power: 1, price_growth: 1.6 }),
+        "mouse_2" => Some(UpgradeInfo { id: "mouse_2", name: "Игровая X7", upgrade_type: "click", base_price: 1024, base_power: 8, price_growth: 1.6 }),
+        "mouse_3" => Some(UpgradeInfo { id: "mouse_3", name: "Logitech G502", upgrade_type: "click", base_price: 16384, base_power: 64, price_growth: 1.6 }),
+        "mouse_4" => Some(UpgradeInfo { id: "mouse_4", name: "Razer DeathAdder", upgrade_type: "click", base_price: 262144, base_power: 512, price_growth: 1.6 }),
+        "mouse_5" => Some(UpgradeInfo { id: "mouse_5", name: "Custom Clicker v2", upgrade_type: "click", base_price: 4194304, base_power: 4096, price_growth: 1.6 }),
+        "mouse_6" => Some(UpgradeInfo { id: "mouse_6", name: "Neural Link", upgrade_type: "click", base_price: 67108864, base_power: 32768, price_growth: 1.6 }),
+        "mouse_7" => Some(UpgradeInfo { id: "mouse_7", name: "Telepathic Command", upgrade_type: "click", base_price: 173741824, base_power: 262144, price_growth: 1.6 }),
+
+        _ => None,
+    }
+}
+
+// Роут /api/click
 async fn api_click_handler(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(payload): Json<ClickPayload>,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let mut redis = state.redis.clone();
-    rate_limit_check(&mut redis, token).await?;
-
-    // click не создаёт пользователя — только для существующих
-    let user = get_game_user(&state.db, &mut redis, token)
-        .await?
-        .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
-
-    let actual_clicks = payload.data.clamp(0, MAX_CLICKS_PER_REQUEST);
-    let delta = actual_clicks.saturating_mul(user.per_click).min(MAX_BALANCE);
-
-    if delta > 0 {
-        let pending_key = format!("pending_balance:{token}");
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("INCRBY").arg(&pending_key).arg(delta).ignore()
-            .cmd("EXPIRE").arg(&pending_key).arg(300i64).ignore()
-            .cmd("SADD").arg("sync_queue").arg(token).ignore();
-        let _: () = pipe.query_async(&mut redis).await.unwrap_or_default();
-    }
-
-    let pending_key = format!("pending_balance:{token}");
-    let pending: i64 = redis.get(&pending_key).await.unwrap_or(0);
-    let optimistic_balance = user.balance.saturating_add(pending).min(MAX_BALANCE);
-
-    Ok(Json(SyncResponse { balance: optimistic_balance, last_sync: now_secs() }))
+    
+    process_clicks_and_sync(&state, token, payload.data).await
 }
 
-// ─── POST /api/sync ────────────────────────────────────────────────────────────
-
+// Роут /api/sync
 async fn api_sync_handler(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let mut redis = state.redis.clone();
-    rate_limit_check(&mut redis, token).await?;
 
-    let user = get_game_user(&state.db, &mut redis, token)
-        .await?
-        .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
-
-    let pending_key = format!("pending_balance:{token}");
-    let pending: i64 = redis.get(&pending_key).await.unwrap_or(0);
-    let now_sec = now_secs();
-    let offline_gains = (now_sec - user.last_sync).max(0) * user.auto_click;
-
-    let current_balance = user.balance
-        .saturating_add(pending)
-        .saturating_add(offline_gains)
-        .min(MAX_BALANCE);
-
-    Ok(Json(SyncResponse { balance: current_balance, last_sync: now_sec }))
+    process_clicks_and_sync(&state, token, 0).await
 }
 
-// ─── Batch sync ────────────────────────────────────────────────────────────────
+// Роут /api/buy_upgrade
+async fn api_buy_upgrade_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<BuyUpgradePayload>,
+) -> Result<Json<GameUser>, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    
+    process_buy_upgrade(&state, token, payload).await
+}
+
+// --- Helpers ---
+
+fn extract_token(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing Authorization header".to_string()))?;
+    auth.strip_prefix("Bearer ")
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid Authorization header format".to_string()))
+}
 
 async fn spawn_db_syncer(db: PgPool, mut redis: ConnectionManager, token: CancellationToken) {
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+    
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let is_leader: bool = redis.set_nx("cron_lock:sync", "1").await.unwrap_or(false);
-                if is_leader {
-                    let _: () = redis.expire("cron_lock:sync", 8).await.unwrap_or_default();
-                    do_batch_sync(&db, &mut redis).await;
-                }
+                do_sync(&db, &mut redis).await;
             }
             _ = token.cancelled() => {
-                let _: () = redis.del("cron_lock:sync").await.unwrap_or_default();
-                do_batch_sync(&db, &mut redis).await;
+                println!("Завершение работы: финальная синхронизация...");
+                do_sync(&db, &mut redis).await;
                 break;
             }
         }
     }
 }
 
-async fn do_batch_sync(db: &PgPool, redis: &mut ConnectionManager) {
-    let tokens: Vec<String> = redis::cmd("SPOP")
-        .arg("sync_queue").arg(10_000)
-        .query_async(redis).await.unwrap_or_default();
-
-    if tokens.is_empty() { return; }
-
-    let mut pipe = redis::pipe();
-    for t in &tokens {
-        pipe.cmd("GETDEL").arg(format!("pending_balance:{t}"));
-    }
-    let deltas_raw: Vec<Option<i64>> = pipe.query_async(redis).await.unwrap_or_default();
-
-    let mut batch_tokens: Vec<String> = Vec::with_capacity(tokens.len());
-    let mut batch_deltas: Vec<i64> = Vec::with_capacity(tokens.len());
-
-    for (t, delta_opt) in tokens.iter().zip(deltas_raw.iter()) {
-        let delta = delta_opt.unwrap_or(0);
+async fn do_sync(db: &PgPool, redis: &mut ConnectionManager) {
+    let tokens: Vec<String> = redis.smembers("sync_queue").await.unwrap_or_default();
+    for t in tokens {
+        let delta: i64 = redis.getset(format!("pending_balance:{}", t), 0).await.unwrap_or(0);
         if delta > 0 {
-            batch_tokens.push(t.clone());
-            batch_deltas.push(delta);
+            let _ = sqlx::query(r#"UPDATE "user" SET balance = balance + $1 WHERE token = $2"#)
+                .bind(delta)
+                .bind(&t)
+                .execute(db).await;
         }
+        let _: () = redis.srem("sync_queue", &t).await.unwrap_or_default();
     }
-
-    if batch_tokens.is_empty() { return; }
-
-    let result = sqlx::query(
-        r#"UPDATE "user" AS u
-           SET balance   = LEAST(u.balance + data.delta, $1),
-               last_sync = EXTRACT(EPOCH FROM NOW())::bigint
-           FROM (SELECT UNNEST($2::text[]) AS token, UNNEST($3::bigint[]) AS delta) AS data
-           WHERE u.token = data.token"#,
-    )
-    .bind(MAX_BALANCE)
-    .bind(&batch_tokens)
-    .bind(&batch_deltas)
-    .execute(db)
-    .await;
-
-    match result {
-        Ok(r) => {
-            println!("✅ Синхронизировано: {} пользователей", r.rows_affected());
-            let mut pipe = redis::pipe();
-            for t in &batch_tokens {
-                pipe.del(format!("user:{t}")).ignore();
-            }
-            let _: () = pipe.query_async(redis).await.unwrap_or_default();
-        }
-        Err(e) => {
-            eprintln!("🚨 Ошибка batch-синхронизации: {e}");
-            let mut pipe = redis::pipe();
-            for (t, &delta) in batch_tokens.iter().zip(batch_deltas.iter()) {
-                let pk = format!("pending_balance:{t}");
-                pipe.cmd("INCRBY").arg(&pk).arg(delta).ignore();
-                pipe.cmd("EXPIRE").arg(&pk).arg(300i64).ignore();
-                pipe.sadd("sync_queue", t).ignore();
-            }
-            let _: () = pipe.query_async(redis).await.unwrap_or_default();
-        }
-    }
-}
-
-// ─── Helpers ───────────────────────────────────────────────────────────────────
-
-fn extract_token(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
-    headers.get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing Authorization header".to_string()))?
-        .strip_prefix("Bearer ")
-        .ok_or((StatusCode::BAD_REQUEST, "Invalid Authorization header format".to_string()))
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 async fn shutdown_signal(token: CancellationToken, _tracker: TaskTracker) {
-    tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
-    println!("Получен сигнал остановки...");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl+c");
+    
+    println!("Получен сигнал остановки (Ctrl+C)...");
     token.cancel();
 }
