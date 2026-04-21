@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/data", get(api_data_handler))
         .route("/api/click", post(api_click_handler))
         .route("/api/sync", post(api_sync_handler))
+        .route("/api/buy-upgrade", post(api_buy_upgrade_handler))
         .with_state(shared_state);
 
     let addr = "0.0.0.0:3719";
@@ -299,7 +300,7 @@ async fn process_buy_upgrade(
 
 pub fn get_upgrade_config(id: &str) -> Option<UpgradeInfo> {
     match id {
-        // --- КАТЕГОРИЯ: GPU (Авто-майнинг) ---
+        // --- КАТЕГОРИЯ: GPU ---
         "gpu_1" => Some(UpgradeInfo { id: "gpu_1", name: "GT 710", upgrade_type: "auto", base_price: 16, base_power: 1, price_growth: 1.6 }),
         "gpu_2" => Some(UpgradeInfo { id: "gpu_2", name: "GTX 1050 Ti", upgrade_type: "auto", base_price: 256, base_power: 8, price_growth: 1.6 }),
         "gpu_3" => Some(UpgradeInfo { id: "gpu_3", name: "RTX 2060 Super", upgrade_type: "auto", base_price: 4096, base_power: 64, price_growth: 1.6 }),
@@ -308,7 +309,7 @@ pub fn get_upgrade_config(id: &str) -> Option<UpgradeInfo> {
         "gpu_6" => Some(UpgradeInfo { id: "gpu_6", name: "Antminer S21 Pro", upgrade_type: "auto", base_price: 16777216, base_power: 32768, price_growth: 1.6 }),
         "gpu_7" => Some(UpgradeInfo { id: "gpu_7", name: "RTX 5090 Ti Prototype", upgrade_type: "auto", base_price: 268435456, base_power: 262144, price_growth: 1.6 }),
 
-        // --- КАТЕГОРИЯ: CPU (Авто-майнинг премиум) ---
+        // --- КАТЕГОРИЯ: CPU ---
         "cpu_1" => Some(UpgradeInfo { id: "cpu_1", name: "Intel Celeron", upgrade_type: "auto", base_price: 32, base_power: 1, price_growth: 1.6 }),
         "cpu_2" => Some(UpgradeInfo { id: "cpu_2", name: "Core i3-10100", upgrade_type: "auto", base_price: 512, base_power: 8, price_growth: 1.6 }),
         "cpu_3" => Some(UpgradeInfo { id: "cpu_3", name: "Core i7-13700K", upgrade_type: "auto", base_price: 8192, base_power: 64, price_growth: 1.6 }),
@@ -317,7 +318,7 @@ pub fn get_upgrade_config(id: &str) -> Option<UpgradeInfo> {
         "cpu_6" => Some(UpgradeInfo { id: "cpu_6", name: "Quantum Cluster", upgrade_type: "auto", base_price: 33554432, base_power: 32768, price_growth: 1.6 }),
         "cpu_7" => Some(UpgradeInfo { id: "cpu_7", name: "EPYC 9654 Farm", upgrade_type: "auto", base_price: 536870912, base_power: 262144, price_growth: 1.6 }),
 
-        // --- КАТЕГОРИЯ: MOUSE (Сила клика) ---
+        // --- КАТЕГОРИЯ: MOUSE ---
         "mouse_1" => Some(UpgradeInfo { id: "mouse_1", name: "Офисная мышь", upgrade_type: "click", base_price: 64, base_power: 1, price_growth: 1.6 }),
         "mouse_2" => Some(UpgradeInfo { id: "mouse_2", name: "Игровая X7", upgrade_type: "click", base_price: 1024, base_power: 8, price_growth: 1.6 }),
         "mouse_3" => Some(UpgradeInfo { id: "mouse_3", name: "Logitech G502", upgrade_type: "click", base_price: 16384, base_power: 64, price_growth: 1.6 }),
