@@ -6,7 +6,7 @@ use tokio_util::{sync::{CancellationToken}, task::{TaskTracker}};
 
 use crate::config;
 use crate::{SharedState};
-use config::{ GameUser, SyncResponse, BuyUpgradePayload, get_upgrade_config, TopUsers, TopUserItem};
+use config::{ get_upgrade_config, GameUser, SyncResponse, BuyUpgradePayload, TopUsers, TopUserItem, TransferReq, TransferRes};
 
 // --- Защита от спама и блокировка токенов ---
 pub async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: &str) -> Result<(), (StatusCode, String)> {
@@ -245,6 +245,107 @@ pub async fn process_get_top_user(
     }
 
     Ok(Json(response))
+}
+pub async fn process_transfer(
+    state: &SharedState,
+    token: &str,
+    payload: TransferReq,
+) -> Result<Json<TransferRes>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+
+    // 1. Валидация
+    if payload.ammount <= 0 {
+        return Err((StatusCode::BAD_REQUEST, "Сумма должна быть больше 0".into()));
+    }
+
+    // 2. Получаем отправителя
+    let sender = get_game_user(&state.db, &mut redis, token)
+        .await?
+        .ok_or((StatusCode::UNAUTHORIZED, "Отправитель не найден".into()))?;
+
+    if sender.id == payload.recipient {
+        return Err((StatusCode::BAD_REQUEST, "Нельзя переводить самому себе".into()));
+    }
+
+    // 3. Транзакция
+    let mut __tx__ = state.db.begin().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Порядок блокировки — защита от Deadlock
+    let (id1, id2) = if sender.id < payload.recipient {
+        (sender.id, payload.recipient)
+    } else {
+        (payload.recipient, sender.id)
+    };
+
+    sqlx::query("SELECT id FROM \"user\" WHERE id IN ($1, $2) FOR UPDATE")
+        .bind(id1)
+        .bind(id2)
+        .execute(&mut *__tx__)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+
+    // 4. Проверка баланса
+    let sender_balance: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1")
+        .bind(sender.id)
+        .fetch_one(&mut *__tx__)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if sender_balance.0 < payload.ammount {
+        return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
+    }
+
+    // 5. Списание
+    sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2")
+        .bind(payload.ammount)
+        .bind(sender.id)
+        .execute(&mut *__tx__)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Зачисление
+    let res = sqlx::query("UPDATE \"user\" SET balance = balance + $1 WHERE id = $2")
+        .bind(payload.ammount)
+        .bind(payload.recipient)
+        .execute(&mut *__tx__)
+        .await;
+
+    if res.is_err() {
+        return Err((StatusCode::NOT_FOUND, "Получатель не найден".into()));
+    }
+
+    // ✅ 5.5 Запись истории перевода (внутри той же транзакции)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    sqlx::query(
+        "INSERT INTO transfer_history (sender_id, recipient_id, amount, created_at)
+         VALUES ($1, $2, $3, $4)"
+    )
+    .bind(sender.id)
+    .bind(payload.recipient)
+    .bind(payload.ammount)
+    .bind(now)
+    .execute(&mut *__tx__)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("History error: {}", e)))?;
+
+    // 6. Фиксация — исправлен проигнорированный Result!
+    __tx__.commit().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 7. Инвалидация кэша
+    let _: () = redis.del(format!("user:{}", token))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(TransferRes {
+        status: "success".into(),
+        new_balance: sender_balance.0 - payload.ammount,
+    }))
 }
 
 // --- Извлечение Bearer токена из заголовков запроса ---
