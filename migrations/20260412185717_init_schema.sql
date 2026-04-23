@@ -16,3 +16,14 @@ CREATE TABLE user_upgrades (
     level INTEGER DEFAULT 0,
     PRIMARY KEY (user_id, upgrade_id)
 );
+
+CREATE TABLE IF NOT EXISTS transfer_history (
+    id          BIGSERIAL PRIMARY KEY,
+    sender_id   BIGINT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+    recipient_id BIGINT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+    amount      BIGINT NOT NULL,
+    created_at  BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_sender    ON transfer_history(sender_id);
+CREATE INDEX IF NOT EXISTS idx_transfer_recipient ON transfer_history(recipient_id);

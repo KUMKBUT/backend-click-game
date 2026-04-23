@@ -82,3 +82,13 @@ pub struct TopUserItem {
 pub struct TopUsers {
     pub users: Vec<TopUserItem>,
 }
+#[derive(Deserialize)]
+pub struct TransferReq {
+    pub ammount: i64,
+    pub recipient: i64,
+}
+#[derive(Serialize)]
+pub struct TransferRes {
+    pub status: String,
+    pub new_balance: i64,
+}
