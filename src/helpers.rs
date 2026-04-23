@@ -6,7 +6,7 @@ use tokio_util::{sync::{CancellationToken}, task::{TaskTracker}};
 
 use crate::config;
 use crate::{SharedState};
-use config::{ GameUser, SyncResponse, BuyUpgradePayload, get_upgrade_config};
+use config::{ GameUser, SyncResponse, BuyUpgradePayload, get_upgrade_config, TopUsers, TopUserItem};
 
 // --- Защита от спама и блокировка токенов ---
 pub async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: &str) -> Result<(), (StatusCode, String)> {
@@ -203,6 +203,48 @@ pub async fn process_buy_upgrade(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Ошибка синхронизации".into()))?;
 
     Ok(Json(updated_user))
+}
+// --- Получения топа юзеров ---
+pub async fn process_get_top_user(
+    state: &SharedState,
+    _token: &str,
+    limit: i64,
+) -> Result<Json<TopUsers>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+    let cache_key = "top_users_50";
+
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(cache_key).await {
+        if let Ok(top_users) = serde_json::from_str::<TopUsers>(&cached_data) {
+            return Ok(Json(top_users));
+        }
+    }
+
+    let users_from_db = sqlx::query_as::<_, GameUser>(
+        r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync 
+           FROM "user" 
+           ORDER BY balance DESC 
+           LIMIT $1"#
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB Error: {}", e)))?;
+
+    let top_list = users_from_db.into_iter().map(|u| TopUserItem {
+        id: u.id,
+        first_name: u.first_name,
+        balance: u.balance,
+        per_click: u.per_click,
+        auto_click: u.auto_click,
+    }).collect();
+
+    let response = TopUsers { users: top_list };
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _: () = redis.set_ex(cache_key, json, 60).await.unwrap_or_default();
+    }
+
+    Ok(Json(response))
 }
 
 // --- Извлечение Bearer токена из заголовков запроса ---

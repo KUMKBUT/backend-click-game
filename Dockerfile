@@ -25,3 +25,5 @@ COPY --from=builder /usr/src/app/target/release/learn-rust ./app
 
 EXPOSE 3719
 CMD ["./app"]
+
+#docker compose build --force-rm && docker compose up

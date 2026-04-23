@@ -69,3 +69,16 @@ pub struct UpgradeInfo {
     pub base_power: i64,
     pub price_growth: f64,
 }
+#[derive(Serialize, Deserialize)] 
+pub struct TopUserItem {
+    pub id: i64,
+    pub first_name: String,
+    pub per_click: i64,
+    pub auto_click: i64,
+    pub balance: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TopUsers {
+    pub users: Vec<TopUserItem>,
+}
