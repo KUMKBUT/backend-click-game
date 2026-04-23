@@ -253,12 +253,10 @@ pub async fn process_transfer(
 ) -> Result<Json<TransferRes>, (StatusCode, String)> {
     let mut redis = state.redis.clone();
 
-    // 1. Валидация
     if payload.ammount <= 0 {
         return Err((StatusCode::BAD_REQUEST, "Сумма должна быть больше 0".into()));
     }
 
-    // 2. Получаем отправителя
     let sender = get_game_user(&state.db, &mut redis, token)
         .await?
         .ok_or((StatusCode::UNAUTHORIZED, "Отправитель не найден".into()))?;
@@ -267,11 +265,9 @@ pub async fn process_transfer(
         return Err((StatusCode::BAD_REQUEST, "Нельзя переводить самому себе".into()));
     }
 
-    // 3. Транзакция
-    let mut __tx__ = state.db.begin().await
+    let mut tx = state.db.begin().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Порядок блокировки — защита от Deadlock
     let (id1, id2) = if sender.id < payload.recipient {
         (sender.id, payload.recipient)
     } else {
@@ -281,14 +277,13 @@ pub async fn process_transfer(
     sqlx::query("SELECT id FROM \"user\" WHERE id IN ($1, $2) FOR UPDATE")
         .bind(id1)
         .bind(id2)
-        .execute(&mut *__tx__)
+        .execute(&mut *tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
 
-    // 4. Проверка баланса
     let sender_balance: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1")
         .bind(sender.id)
-        .fetch_one(&mut *__tx__)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -296,26 +291,23 @@ pub async fn process_transfer(
         return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
     }
 
-    // 5. Списание
     sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2")
         .bind(payload.ammount)
         .bind(sender.id)
-        .execute(&mut *__tx__)
+        .execute(&mut *tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Зачисление
     let res = sqlx::query("UPDATE \"user\" SET balance = balance + $1 WHERE id = $2")
         .bind(payload.ammount)
         .bind(payload.recipient)
-        .execute(&mut *__tx__)
+        .execute(&mut *tx)
         .await;
 
     if res.is_err() {
         return Err((StatusCode::NOT_FOUND, "Получатель не найден".into()));
     }
 
-    // ✅ 5.5 Запись истории перевода (внутри той же транзакции)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -329,15 +321,13 @@ pub async fn process_transfer(
     .bind(payload.recipient)
     .bind(payload.ammount)
     .bind(now)
-    .execute(&mut *__tx__)
+    .execute(&mut *tx)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("History error: {}", e)))?;
 
-    // 6. Фиксация — исправлен проигнорированный Result!
-    __tx__.commit().await
+    tx.commit().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 7. Инвалидация кэша
     let _: () = redis.del(format!("user:{}", token))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
