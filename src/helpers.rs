@@ -1,4 +1,4 @@
-use axum::{Json, http::{HeaderMap, StatusCode, header}};
+use axum::{Json, http::{HeaderMap, StatusCode, header}, extract::{State ,ws::{Message, WebSocket, WebSocketUpgrade}}};
 use redis::{aio::ConnectionManager, AsyncCommands};
 use std::{time::{SystemTime, UNIX_EPOCH}};
 use sqlx::postgres::{PgPool};
@@ -336,6 +336,38 @@ pub async fn process_transfer(
         status: "success".into(),
         new_balance: sender_balance.0 - payload.ammount,
     }))
+}
+
+// --- Работа с WebSocket ---
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
+    println!("Новое WS соединение установлено!");
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Message::Text(text) => {
+                println!("Клиент прислал текст: {}", text);
+                
+                if text == "ping" {
+                    if socket.send(Message::Text("pong".to_string())).await.is_err() {
+                        println!("Клиент отвалился");
+                        break;
+                    }
+                }
+            }
+            Message::Close(_) => {
+                println!("Клиент закрыл соединение");
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 // --- Извлечение Bearer токена из заголовков запроса ---
