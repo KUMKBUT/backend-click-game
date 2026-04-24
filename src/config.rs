@@ -92,3 +92,23 @@ pub struct TransferRes {
     pub status: String,
     pub new_balance: i64,
 }
+// Ws config 
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum WsIncoming {
+    #[serde(rename = "auth")]
+    Auth { token: String },
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum WsOutgoing {
+    #[serde(rename = "auth_success")]
+    AuthSuccess,
+    #[serde(rename = "pong")]
+    Pong,
+    #[serde(rename = "error")]
+    Error { message: String },
+}

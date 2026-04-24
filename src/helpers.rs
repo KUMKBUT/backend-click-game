@@ -6,7 +6,13 @@ use tokio_util::{sync::{CancellationToken}, task::{TaskTracker}};
 
 use crate::config;
 use crate::{SharedState};
-use config::{ get_upgrade_config, GameUser, SyncResponse, BuyUpgradePayload, TopUsers, TopUserItem, TransferReq, TransferRes};
+use config::{ 
+    get_upgrade_config, GameUser, 
+    SyncResponse, BuyUpgradePayload, 
+    TopUsers, TopUserItem, 
+    TransferReq, TransferRes,
+    WsIncoming, WsOutgoing
+};
 
 // --- Защита от спама и блокировка токенов ---
 pub async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: &str) -> Result<(), (StatusCode, String)> {
@@ -347,25 +353,112 @@ pub async fn ws_handler(
 }
 
 pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
-    println!("Новое WS соединение установлено!");
+    let mut current_token: Option<String> = None;
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        if let Message::Text(text) = msg {
+            if let Ok(WsIncoming::Auth { token }) = serde_json::from_str::<WsIncoming>(&text) {
+                
+                let redis_user_key = format!("user:{}", &token);
+                let mut redis_conn = state.redis.clone();
+                
+                let exists_in_cache: bool = redis_conn
+                    .exists(&redis_user_key)
+                    .await
+                    .unwrap_or(false);
+
+                let mut is_valid = exists_in_cache;
+
+                if !is_valid {
+                    let db_user = sqlx::query("SELECT id FROM \"user\" WHERE token = $1")
+                        .bind(&token) 
+                        .fetch_optional(&state.db)
+                        .await
+                        .unwrap_or(None);
+
+                    if db_user.is_some() {
+                        let _: () = redis_conn
+                            .set_ex(&redis_user_key, "1", 900)
+                            .await
+                            .unwrap_or_default();
+                        is_valid = true;
+                    }
+                }
+
+                if is_valid {
+                    let saved_token = token.clone();
+
+                    let _: () = redis_conn
+                        .set_ex(format!("online:{}", &saved_token), "1", 60)
+                        .await
+                        .unwrap_or_default();
+
+                    let response = serde_json::to_string(&WsOutgoing::AuthSuccess).unwrap();
+                    let _ = socket.send(Message::Text(response)).await;
+
+                    current_token = Some(saved_token);
+                    break; 
+                } else {
+                    let error = serde_json::to_string(&WsOutgoing::Error { message: "Invalid token".into() }).unwrap();
+                    let _ = socket.send(Message::Text(error)).await;
+                }
+            }
+        }
+    }
+
+    let Some(token) = current_token else {
+        return;
+    };
 
     while let Some(Ok(msg)) = socket.recv().await {
         match msg {
             Message::Text(text) => {
-                println!("Клиент прислал текст: {}", text);
-                
-                if text == "ping" {
-                    if socket.send(Message::Text("pong".to_string())).await.is_err() {
-                        println!("Клиент отвалился");
-                        break;
+                if let Ok(WsIncoming::Ping) = serde_json::from_str::<WsIncoming>(&text) {
+                    let mut redis_conn = state.redis.clone();
+
+                    let _: () = redis_conn
+                        .set_ex(format!("online:{}", &token), "1", 60)
+                        .await
+                        .unwrap_or_default();
+
+                    let pong = serde_json::to_string(&WsOutgoing::Pong).unwrap();
+                    if socket.send(Message::Text(pong)).await.is_err() {
+                        break; 
                     }
                 }
             }
-            Message::Close(_) => {
-                println!("Клиент закрыл соединение");
-                break;
-            }
+            Message::Close(_) => break,
             _ => {}
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let mut redis_conn = state.redis.clone();
+
+    let _: () = redis_conn
+        .del(format!("online:{}", &token))
+        .await
+        .unwrap_or_default();
+
+    match sqlx::query("UPDATE \"user\" SET last_sync = $1 WHERE token = $2")
+        .bind(now)
+        .bind(&token)
+        .execute(&state.db)
+        .await 
+    {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                eprintln!("WS Warning: last_sync не обновлен. Пользователь с токеном {} не найден в БД", &token);
+            } else {
+                println!("WS: Состояние юзера {} успешно сохранено", &token);
+            }
+        }
+        Err(e) => {
+            eprintln!("WS Error: Критическая ошибка при сохранении last_sync для {}: {}", &token, e);
         }
     }
 }
