@@ -6,7 +6,11 @@ use tokio_util::{sync::{CancellationToken}, task::{TaskTracker}};
 
 mod config;
 mod helpers;
-use helpers::{ extract_token, spawn_db_syncer, shutdown_signal, process_clicks_and_sync, process_fetch_data_user, process_buy_upgrade, process_get_top_user, process_transfer};
+use helpers::{ 
+    extract_token, spawn_db_syncer, shutdown_signal, 
+    process_clicks_and_sync, process_fetch_data_user, process_buy_upgrade, 
+    process_get_top_user, process_transfer, ws_handler
+};
 use config::{ GameUser, ClickPayload, SyncResponse, BuyUpgradePayload, TopUsers, TransferReq, TransferRes};
 pub struct AppState {
     pub db: PgPool,
@@ -54,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/buy-upgrade", post(api_buy_upgrade_handler))
         .route("/api/top", post(api_top_user_handler))
         .route("/api/transfer", post(api_transfer_handler))
+        .route("/ws", get(ws_handler))
         .with_state(shared_state);
 
     let addr = "0.0.0.0:3719";
