@@ -116,6 +116,7 @@ pub enum WsOutgoing {
 pub struct ServiceHistoryItem {
 	pub id: i64,
 	pub uuid: String,
+    pub status: String,
 	pub ammount: i64,
 	pub date: i64
 }
