@@ -9,14 +9,15 @@ mod helpers;
 use helpers::{ 
     extract_token, spawn_db_syncer, shutdown_signal, 
     process_clicks_and_sync, process_fetch_data_user, process_buy_upgrade, 
-    process_get_top_user, process_transfer, ws_handler, 
-    process_create_service
+    process_get_top_user, process_transfer, ws_handler
 };
 use config::{ 
     GameUser, ClickPayload, SyncResponse, 
-    BuyUpgradePayload, TopUsers, TransferReq, 
-    TransferRes, ServiceCreateRes, ServiceCreateReq
+    BuyUpgradePayload, TopUsers, TransferReq, TransferRes
 };
+
+mod services;
+use crate::services::routes::api_service_create_handler;
 pub struct AppState {
     pub db: PgPool,
     pub redis: ConnectionManager,
@@ -140,14 +141,3 @@ async fn api_transfer_handler(
     process_transfer(&state, token, payload).await
 }
 
-// Блок апи для сервисов
-// Роут /api/service/create
-async fn api_service_create_handler(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    Json(payload): Json<ServiceCreateReq>,
-) -> Result<Json<ServiceCreateRes>,( StatusCode, String)> {
-    let token = extract_token(&headers)?;
-
-    process_create_service(&state, token, payload).await
-}
