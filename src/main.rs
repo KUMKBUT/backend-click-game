@@ -9,9 +9,14 @@ mod helpers;
 use helpers::{ 
     extract_token, spawn_db_syncer, shutdown_signal, 
     process_clicks_and_sync, process_fetch_data_user, process_buy_upgrade, 
-    process_get_top_user, process_transfer, ws_handler
+    process_get_top_user, process_transfer, ws_handler, 
+    process_create_service
 };
-use config::{ GameUser, ClickPayload, SyncResponse, BuyUpgradePayload, TopUsers, TransferReq, TransferRes};
+use config::{ 
+    GameUser, ClickPayload, SyncResponse, 
+    BuyUpgradePayload, TopUsers, TransferReq, 
+    TransferRes, ServiceCreateRes, ServiceCreateReq
+};
 pub struct AppState {
     pub db: PgPool,
     pub redis: ConnectionManager,
@@ -59,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/top", post(api_top_user_handler))
         .route("/api/transfer", post(api_transfer_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/service/create", post(api_service_create_handler))
         .with_state(shared_state);
 
     let addr = "0.0.0.0:3719";
@@ -132,4 +138,16 @@ async fn api_transfer_handler(
     let token = extract_token(&headers)?;
 
     process_transfer(&state, token, payload).await
+}
+
+// Блок апи для сервисов
+// Роут /api/service/create
+async fn api_service_create_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServiceCreateReq>,
+) -> Result<Json<ServiceCreateRes>,( StatusCode, String)> {
+    let token = extract_token(&headers)?;
+
+    process_create_service(&state, token, payload).await
 }
