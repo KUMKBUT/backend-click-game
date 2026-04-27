@@ -66,7 +66,34 @@ pub async fn get_game_user(
     }
     Ok(user)
 }
+// --- Получени пользователя из бд или кеша по id ---
+pub async fn get_game_user_id(
+    db: &PgPool, 
+    redis: &mut redis::aio::ConnectionManager, 
+    id: i64
+) -> Result<Option<GameUser>, (StatusCode, String)> {
+    let cache_key = format!("user_id:{}", id);
 
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await {
+        if let Ok(user) = serde_json::from_str(&cached_data) {
+            return Ok(Some(user));
+        }
+    }
+
+    let user = sqlx::query_as::<_, GameUser>(
+        r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync FROM "user" WHERE id = $1"#
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(u) = &user {
+        let json = serde_json::to_string(u).unwrap();
+        let _: () = redis.set_ex(&cache_key, json, 60).await.unwrap_or_default();
+    }
+    Ok(user)
+}
 // --- Общая логика начисления баланса ---
 pub async fn process_clicks_and_sync(
     state: &SharedState,
@@ -252,6 +279,7 @@ pub async fn process_get_top_user(
 
     Ok(Json(response))
 }
+
 pub async fn process_transfer(
     state: &SharedState,
     token: &str,
