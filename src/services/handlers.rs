@@ -1,13 +1,13 @@
-use axum::{Json, http::{StatusCode}};
+use axum::{Json, http::StatusCode};
 use redis::{AsyncCommands};
 use std::{time::{SystemTime, UNIX_EPOCH}};
-use sqlx;
+use sqlx::Row;
 
 use crate::{SharedState};
 use super::{ 
-    config::{ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes}
+    config::{ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceTransferToUserReq, ServiceTransferToUserRes}
 };
-use crate::{helpers::get_game_user};
+use crate::{helpers::{get_game_user, get_game_user_id}};
 
 // --- Создание сервиса ---
 pub async fn process_create_service(
@@ -104,4 +104,69 @@ pub async fn process_get_info_service(
     }
 
     Ok(Json(service))
+}
+
+pub async fn process_transfer_to_user(
+    state: &SharedState,
+    id: &str,
+    payload: ServiceTransferToUserReq,
+) -> Result<Json<ServiceTransferToUserRes>, (StatusCode, String)>{
+    let mut redis = state.redis.clone();
+    
+    if payload.ammount <= 0 {
+        return Err((StatusCode::BAD_REQUEST, "Сумма должна быть больше 0!".into()));
+    }
+
+    let receiver = get_game_user_id(&state.db, &mut redis, payload.reciever_id)
+        .await?
+        .ok_or((StatusCode::UNAUTHORIZED, "Получатель не найден!".into()))?;
+
+    let mut tx = state.db.begin().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let service_row = sqlx::query("SELECT balance FROM service WHERE uuid = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Ошибка блокировки сервиса: {}", e)))?;
+
+    let current_service_balance: i64 = service_row.get("balance");
+
+    if current_service_balance < payload.ammount {
+        return Err((StatusCode::PAYMENT_REQUIRED, "На балансе сервиса недостаточно средств!".into()));
+    }
+
+    let _ = sqlx::query(r#"SELECT id FROM "user" WHERE id = $1 FOR UPDATE"#)
+        .bind(receiver.id) 
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Ошибка блокировки получателя: {}", e)))?;
+
+    sqlx::query("UPDATE service SET balance = balance - $1 WHERE uuid = $2")
+        .bind(payload.ammount)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    sqlx::query(r#"UPDATE "user" SET balance = balance + $1 WHERE id = $2"#)
+        .bind(payload.ammount)
+        .bind(receiver.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let _: () = redis.del(format!("service:{}", id)).await.unwrap_or_default();
+    let _: () = redis.del(format!("user_id:{}", receiver.id)).await.unwrap_or_default();
+    let _: () = redis.del(format!("user:{}", receiver.token)).await.unwrap_or_default();
+    
+    let response = ServiceTransferToUserRes{
+        status: "success".to_string(),
+        message: format!("Успешно доставлено: {} пользователю: {}", payload.ammount, receiver.first_name)
+    };
+
+    Ok(Json(response))
 }

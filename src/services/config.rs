@@ -43,3 +43,13 @@ pub struct ServiceGetInfoRes {
 	pub url_img: String,
 	pub reg_date: i64,
 }
+#[derive(Deserialize)]
+pub struct ServiceTransferToUserReq {
+	pub ammount: i64,
+	pub reciever_id: i64,
+}
+#[derive(Serialize)]
+pub struct ServiceTransferToUserRes {
+	pub status: String,
+	pub message: String,
+}
