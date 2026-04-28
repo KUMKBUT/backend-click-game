@@ -70,8 +70,6 @@ pub async fn process_create_service(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    
-
     Ok(Json(response))
 }
 
@@ -91,7 +89,7 @@ pub async fn process_get_info_service(
 
     let service = sqlx::query_as::<_, ServiceGetInfoRes>(
         "SELECT uuid, name as first_name, description, balance, callback_url, url_img, reg_date
-        FROM services WHERE uuid + $1"
+        FROM services WHERE uuid = $1"
     )
     .bind(&id)
     .fetch_optional(&state.db)
