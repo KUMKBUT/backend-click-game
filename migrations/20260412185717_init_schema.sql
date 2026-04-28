@@ -28,14 +28,22 @@ CREATE TABLE IF NOT EXISTS transfer_history (
 CREATE INDEX IF NOT EXISTS idx_transfer_sender    ON transfer_history(sender_id);
 CREATE INDEX IF NOT EXISTS idx_transfer_recipient ON transfer_history(recipient_id);
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
+-- Таблица сервисов
 CREATE TABLE service (
-    uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    uuid TEXT PRIMARY KEY,
     creator_id BIGINT NOT NULL,
     name TEXT NOT NULL,
     description TEXT DEFAULT '',
     balance BIGINT DEFAULT 0,
+    callback_url TEXT,
     url_img TEXT,
     reg_date BIGINT NOT NULL
+);
+CREATE TABLE service_history (
+    id SERIAL PRIMARY KEY,
+    service_uuid TEXT REFERENCES service(uuid) ON DELETE CASCADE,
+    amount BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    created_at BIGINT NOT NULL
 );

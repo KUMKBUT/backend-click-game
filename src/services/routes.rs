@@ -24,9 +24,9 @@ pub async fn api_service_get_info_handler(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<ServiceGetInfoRes>,( StatusCode, String)> {
-    let token = extract_token(&headers)?;
+    let id = extract_token(&headers)?;
 
-    process_get_info_service(&state, &token).await
+    process_get_info_service(&state, &id).await
 }
 
 pub async fn api_service_transfer_to_user_handler(
@@ -34,7 +34,7 @@ pub async fn api_service_transfer_to_user_handler(
     headers: HeaderMap,
     Json(payload): Json<ServiceTransferToUserReq>,
 ) -> Result<Json<ServiceTransferToUserRes>,( StatusCode, String)> {
-    let token = extract_token(&headers)?;
+    let id = extract_token(&headers)?;
 
-    process_transfer_to_user(&state, &token, payload).await
+    process_transfer_to_user(&state, &id, payload).await
 }
