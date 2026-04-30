@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, sqlx::Type)]
 pub enum ServiceHistoryStatus {
     #[serde(rename = "to_service")]
     ToService,
@@ -8,7 +8,7 @@ pub enum ServiceHistoryStatus {
     FromService,
 }
 
-#[derive(Serialize, Deserialize)] 
+#[derive(Serialize, Deserialize, Debug, Clone, sqlx::FromRow)] 
 pub struct ServiceHistoryItem {
 	pub id: i64,
 	pub uuid: String,
@@ -16,16 +16,19 @@ pub struct ServiceHistoryItem {
 	pub ammount: i64,
 	pub date: i64
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, sqlx::FromRow, Debug, Clone)]
 pub struct ServiceCreateRes {
 	pub uuid: String,
 	pub first_name: String,
+	pub creator_id: i64,
 	pub description: String,
 	pub balance: i64,
-	pub callback_url: String,
-	pub history: Vec<ServiceHistoryItem>,
-	pub url_img: String,
+	pub callback_url: String, 
+  pub url_img: String,
 	pub reg_date: i64,
+  pub maintenance: bool,
+  #[sqlx(skip)]
+  pub history: Vec<ServiceHistoryItem>,
 }
 #[derive(Deserialize)]
 pub struct ServiceCreateReq {
@@ -52,4 +55,9 @@ pub struct ServiceTransferToUserReq {
 pub struct ServiceTransferToUserRes {
 	pub status: String,
 	pub message: String,
+}
+#[derive(Serialize, Deserialize, sqlx::FromRow, Debug, Clone)]
+pub struct ServiceMaintenanceSwitch {
+    pub status: String,
+    pub maintenance: bool,
 }
