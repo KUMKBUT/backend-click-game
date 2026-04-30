@@ -83,9 +83,15 @@ pub struct TopUsers {
     pub users: Vec<TopUserItem>,
 }
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Recipient {
+    User(i64),
+    Service(String),
+}
+#[derive(Deserialize)]
 pub struct TransferReq {
     pub ammount: i64,
-    pub recipient: i64,
+    pub recipient: Recipient,
 }
 #[derive(Serialize)]
 pub struct TransferRes {

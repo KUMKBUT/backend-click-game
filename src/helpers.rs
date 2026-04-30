@@ -11,7 +11,8 @@ use config::{
     SyncResponse, BuyUpgradePayload, 
     TopUsers, TopUserItem, 
     TransferReq, TransferRes,
-    WsIncoming, WsOutgoing
+    WsIncoming, WsOutgoing,
+    Recipient
 };
 
 // --- Защита от спама и блокировка токенов ---
@@ -27,12 +28,11 @@ pub async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: 
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
 
     let last_req: Option<i64> = redis.get(&rl_key).await.unwrap_or(None);
-    if let Some(last) = last_req {
-        if now_ms - last < 1500 {
+    if let Some(last) = last_req
+        && now_ms - last < 1500 {
             let _: () = redis.set_ex(&blocked_key, "1", 900).await.unwrap_or_default();
             return Err((StatusCode::TOO_MANY_REQUESTS, "Spam detected. Blocked for 15 minutes".into()));
         }
-    }
 
     let _: () = redis.set_ex(&rl_key, now_ms, 2).await.unwrap_or_default();
     Ok(())
@@ -46,11 +46,10 @@ pub async fn get_game_user(
 ) -> Result<Option<GameUser>, (StatusCode, String)> {
     let cache_key = format!("user:{}", token);
 
-    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await {
-        if let Ok(user) = serde_json::from_str(&cached_data) {
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await
+        && let Ok(user) = serde_json::from_str(&cached_data) {
             return Ok(Some(user));
         }
-    }
 
     let user = sqlx::query_as::<_, GameUser>(
         r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync FROM "user" WHERE token = $1"#
@@ -74,11 +73,10 @@ pub async fn get_game_user_id(
 ) -> Result<Option<GameUser>, (StatusCode, String)> {
     let cache_key = format!("user_id:{}", id);
 
-    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await {
-        if let Ok(user) = serde_json::from_str(&cached_data) {
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await
+        && let Ok(user) = serde_json::from_str(&cached_data) {
             return Ok(Some(user));
         }
-    }
 
     let user = sqlx::query_as::<_, GameUser>(
         r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync FROM "user" WHERE id = $1"#
@@ -183,7 +181,7 @@ pub async fn process_buy_upgrade(
 
     let upgrade_row: (i32,) = sqlx::query_as("SELECT level FROM user_upgrades WHERE user_id = $1 AND upgrade_id = $2")
         .bind(user.id)
-        .bind(&config.id)
+        .bind(config.id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -215,7 +213,7 @@ pub async fn process_buy_upgrade(
         ON CONFLICT (user_id, upgrade_id) DO UPDATE SET level = user_upgrades.level + 1
     "#)
     .bind(user.id)
-    .bind(&config.id)
+    .bind(config.id)
     .execute(&mut *tx).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -246,11 +244,10 @@ pub async fn process_get_top_user(
     let mut redis = state.redis.clone();
     let cache_key = "top_users_50";
 
-    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(cache_key).await {
-        if let Ok(top_users) = serde_json::from_str::<TopUsers>(&cached_data) {
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(cache_key).await
+        && let Ok(top_users) = serde_json::from_str::<TopUsers>(&cached_data) {
             return Ok(Json(top_users));
         }
-    }
 
     let users_from_db = sqlx::query_as::<_, GameUser>(
         r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync 
@@ -295,80 +292,147 @@ pub async fn process_transfer(
         .await?
         .ok_or((StatusCode::UNAUTHORIZED, "Отправитель не найден".into()))?;
 
-    if sender.id == payload.recipient {
-        return Err((StatusCode::BAD_REQUEST, "Нельзя переводить самому себе".into()));
-    }
-
     let mut tx = state.db.begin().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let (id1, id2) = if sender.id < payload.recipient {
-        (sender.id, payload.recipient)
-    } else {
-        (payload.recipient, sender.id)
-    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
-    sqlx::query("SELECT id FROM \"user\" WHERE id IN ($1, $2) FOR UPDATE")
-        .bind(id1)
-        .bind(id2)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+    match payload.recipient {
+        Recipient::User(recipient_id) => {
+            if sender.id == recipient_id {
+                return Err((StatusCode::BAD_REQUEST, "Нельзя переводить самому себе".into()));
+            }
 
-    let sender_balance: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1")
-        .bind(sender.id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let (id1, id2) = if sender.id < recipient_id { (sender.id, recipient_id) } else { (recipient_id, sender.id) };
+            
+            sqlx::query("SELECT id FROM \"user\" WHERE id IN ($1, $2) FOR UPDATE")
+                .bind(id1)
+                .bind(id2)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
 
-    if sender_balance.0 < payload.ammount {
-        return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
+            let row: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1")
+                .bind(sender.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            
+            let current_balance = row.0;
+
+            if current_balance < payload.ammount {
+                return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
+            }
+
+            sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2")
+                .bind(payload.ammount)
+                .bind(sender.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+
+            let update_res = sqlx::query("UPDATE \"user\" SET balance = balance + $1 WHERE id = $2")
+                .bind(payload.ammount)
+                .bind(recipient_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+
+            if update_res.rows_affected() == 0 {
+                return Err((StatusCode::NOT_FOUND, "Получатель не найден".into()));
+            }
+
+            sqlx::query("INSERT INTO transfer_history (sender_id, recipient_id, amount, created_at) VALUES ($1, $2, $3, $4)")
+                .bind(sender.id)
+                .bind(recipient_id)
+                .bind(payload.ammount)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+        }
+
+        Recipient::Service(service_uuid) => {
+            let redis_key = format!("service:{}", service_uuid);
+            let cached_data: Option<String> = redis.get(&redis_key).await.unwrap_or(None);
+
+            // Сначала пробуем достать из кэша
+            let (creator_id, is_maintenance) = if let Some(data) = cached_data {
+                // Парсим JSON и извлекаем поля, если они там есть
+                let json: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+                let cid = json.get("creator_id").and_then(|v| v.as_i64());
+                let maint = json.get("maintenance").and_then(|v| v.as_bool());
+
+                if let (Some(c), Some(m)) = (cid, maint) {
+                    (c, m)
+                } else {
+                    // Если в JSON не оказалось нужных полей (старая версия кэша), идем в БД
+                    fetch_service_from_db(&state.db, &service_uuid).await?
+                }
+            } else {
+                // Если в Redis вообще ничего нет — идем в БД
+                fetch_service_from_db(&state.db, &service_uuid).await?
+            };
+
+            // Проверка на тех. обслуживание
+            if is_maintenance && sender.id != creator_id {
+                return Err((StatusCode::FORBIDDEN, "Сервис на тех. обслуживании. Переводы доступны только владельцу".into()));
+            }
+
+            // Блокируем баланс юзера и проверяем средства
+            let row: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1 FOR UPDATE")
+                .bind(sender.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if row.0 < payload.ammount {
+                return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
+            }
+
+            // Списываем у юзера
+            sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2")
+                .bind(payload.ammount)
+                .bind(sender.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            // Зачисляем сервису
+            sqlx::query("UPDATE service SET balance = balance + $1 WHERE uuid = $2")
+                .bind(payload.ammount)
+                .bind(&service_uuid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            // Запись в историю сервиса
+            sqlx::query(
+                "INSERT INTO service_history (service_uuid, amount, user_id, status, created_at, maintenance) 
+                 VALUES ($1, $2, $3, $4, $5, $6)"
+            )
+            .bind(&service_uuid)
+            .bind(payload.ammount)
+            .bind(sender.id)
+            .bind("to_service")
+            .bind(now)
+            .bind(is_maintenance)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
     }
 
-    sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2")
-        .bind(payload.ammount)
-        .bind(sender.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let res = sqlx::query("UPDATE \"user\" SET balance = balance + $1 WHERE id = $2")
-        .bind(payload.ammount)
-        .bind(payload.recipient)
-        .execute(&mut *tx)
-        .await;
-
-    if res.is_err() {
-        return Err((StatusCode::NOT_FOUND, "Получатель не найден".into()));
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    sqlx::query(
-        "INSERT INTO transfer_history (sender_id, recipient_id, amount, created_at)
-         VALUES ($1, $2, $3, $4)"
-    )
-    .bind(sender.id)
-    .bind(payload.recipient)
-    .bind(payload.ammount)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("History error: {}", e)))?;
-
+    // Фиксация изменений
     tx.commit().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let _: () = redis.del(format!("user:{}", token))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Инвалидация кэша баланса пользователя
+    let _: () = redis.del(format!("user:{}", token)).await.unwrap_or_default();
 
     Ok(Json(TransferRes {
         status: "success".into(),
-        new_balance: sender_balance.0 - payload.ammount,
+        new_balance: sender.balance - payload.ammount,
     }))
 }
 
@@ -384,8 +448,8 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     let mut current_token: Option<String> = None;
 
     while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(text) = msg {
-            if let Ok(WsIncoming::Auth { token }) = serde_json::from_str::<WsIncoming>(&text) {
+        if let Message::Text(text) = msg
+            && let Ok(WsIncoming::Auth { token }) = serde_json::from_str::<WsIncoming>(&text) {
                 
                 let redis_user_key = format!("user:{}", &token);
                 let mut redis_conn = state.redis.clone();
@@ -431,7 +495,6 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                     let _ = socket.send(Message::Text(error)).await;
                 }
             }
-        }
     }
 
     let Some(token) = current_token else {
@@ -542,4 +605,17 @@ pub async fn shutdown_signal(token: CancellationToken, _tracker: TaskTracker) {
     
     println!("Получен сигнал остановки (Ctrl+C)...");
     token.cancel();
+}
+
+async fn fetch_service_from_db(db: &sqlx::PgPool, uuid: &str) -> Result<(i64, bool), (StatusCode, String)> {
+    let row: (i64, bool) = sqlx::query_as(
+        "SELECT creator_id, maintenance FROM service WHERE uuid = $1"
+    )
+    .bind(uuid)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or((StatusCode::NOT_FOUND, "Сервис не найден".into()))?;
+
+    Ok(row)
 }
