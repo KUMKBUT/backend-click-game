@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::{SharedState};
 use super::{ 
-    config::{ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceTransferToUserReq, ServiceTransferToUserRes}
+    config::{ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceMaintenanceSwitch}
 };
 use crate::{helpers::{get_game_user, get_game_user_id}};
 
@@ -50,12 +50,14 @@ pub async fn process_create_service(
     let response = ServiceCreateRes {
         uuid: uuid.clone(),
         first_name: name,
+        creator_id: creator_id.id,
         description: "".to_string(),
         balance: 0,
-        callback_url: callback_url,
+        callback_url,
         history: vec![],
         url_img,
         reg_date: chrono::Utc::now().timestamp(),
+        maintenance: true,
     };
 
     let json_data = serde_json::to_string(&response)
@@ -79,19 +81,19 @@ pub async fn process_get_info_service(
 ) -> Result<Json<ServiceGetInfoRes>, (StatusCode, String)>{
     let mut redis = state.redis.clone();
 
-    let key = format!("service: {}", id);
+    let key = format!("service:{}", id);
 
-    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&key).await {
-        if let Ok(response) = serde_json::from_str::<ServiceGetInfoRes>(&cached_data) {
-            return Ok(Json(response));
-        }
-    };
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&key).await
+        && let Ok(response) = serde_json::from_str::<ServiceGetInfoRes>(&cached_data) 
+    {
+        return Ok(Json(response));
+    }
 
     let service = sqlx::query_as::<_, ServiceGetInfoRes>(
         "SELECT uuid, name as first_name, description, balance, callback_url, url_img, reg_date
         FROM services WHERE uuid = $1"
     )
-    .bind(&id)
+    .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Ошибка БД: {}", e)))?
@@ -117,7 +119,7 @@ pub async fn process_transfer_to_user(
 
     let receiver = get_game_user_id(&state.db, &mut redis, payload.reciever_id)
         .await?
-        .ok_or((StatusCode::UNAUTHORIZED, "Получатель не найден!".into()))?;
+        .ok_or((StatusCode::UNAUTHORIZED, "Получатель не найден.".into()))?;
 
     let mut tx = state.db.begin().await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -167,4 +169,45 @@ pub async fn process_transfer_to_user(
     };
 
     Ok(Json(response))
+}
+pub async fn process_switch_maintance_status(
+    state: &SharedState,
+    id: &str,
+) -> Result<Json<ServiceMaintenanceSwitch>, (StatusCode, String)>{
+    let mut redis = state.redis.clone();
+
+    let cache_key = format!("service:{}", id);
+
+    if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await
+        && let Ok(response) = serde_json::from_str::<ServiceMaintenanceSwitch>(&cached_data) 
+    {
+        return Ok(Json(response));
+    }
+
+    let service = sqlx::query_as::<_, ServiceCreateRes>(
+        r#"
+        UPDATE service
+        SET maintenance = NOT maintenance
+        WHERE uuid = $1
+        RETURNING uuid, url_img, name AS first_name, description, balance, callback_url, reg_date, maintenance, creator_id
+        "#
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or((StatusCode::NOT_FOUND, "Service not found".into()))?;
+
+    let json_data = serde_json::to_string(&service)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let _: () = redis
+        .set_ex(&cache_key, json_data, 3600)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ServiceMaintenanceSwitch {
+        status: "success".into(),
+        maintenance: service.maintenance,
+    }))
 }

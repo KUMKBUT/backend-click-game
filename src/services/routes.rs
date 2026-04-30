@@ -2,10 +2,12 @@ use axum::{Json, extract::{State}, http::{HeaderMap, StatusCode}};
 
 use crate::{SharedState};
 use super::{
-    handlers::{process_create_service, process_get_info_service, process_transfer_to_user}, 
+    handlers::{process_create_service, process_get_info_service, process_transfer_to_user, process_switch_maintance_status}, 
     config::{
         ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes,
-        ServiceTransferToUserRes, ServiceTransferToUserReq
+        ServiceTransferToUserRes, ServiceTransferToUserReq,
+        ServiceMaintenanceSwitch
+
     }
 };
 use crate::helpers::extract_token;
@@ -26,7 +28,7 @@ pub async fn api_service_get_info_handler(
 ) -> Result<Json<ServiceGetInfoRes>,( StatusCode, String)> {
     let id = extract_token(&headers)?;
 
-    process_get_info_service(&state, &id).await
+    process_get_info_service(&state, id).await
 }
 
 pub async fn api_service_transfer_to_user_handler(
@@ -36,5 +38,14 @@ pub async fn api_service_transfer_to_user_handler(
 ) -> Result<Json<ServiceTransferToUserRes>,( StatusCode, String)> {
     let id = extract_token(&headers)?;
 
-    process_transfer_to_user(&state, &id, payload).await
+    process_transfer_to_user(&state, id, payload).await
+}
+
+pub async fn api_service_switch_maintance_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<ServiceMaintenanceSwitch>,( StatusCode, String)> {
+    let id = extract_token(&headers)?;
+
+    process_switch_maintance_status(&state, id).await
 }
