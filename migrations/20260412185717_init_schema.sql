@@ -37,7 +37,8 @@ CREATE TABLE service (
     balance BIGINT DEFAULT 0,
     callback_url TEXT,
     url_img TEXT,
-    reg_date BIGINT NOT NULL
+    reg_date BIGINT NOT NULL,
+    maintenance BOOLEAN NOT NULL DEFAULT TRUE
 );
 CREATE TABLE service_history (
     id SERIAL PRIMARY KEY,
