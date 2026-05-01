@@ -7,14 +7,14 @@ use axum::{
 use super::{
     config::{
         ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceMaintenanceSwitch,
-        ServiceTransferToUserReq, ServiceTransferToUserRes,
+        ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceCallbackPayload, ServiceSetCallbackUrlReq, ServiceSetCallbackUrlRes
     },
     handlers::{
         process_create_service, process_get_info_service, process_switch_maintance_status,
-        process_transfer_to_user,
+        process_transfer_to_user, process_set_callback_url
     },
 };
-use crate::SharedState;
+use crate::{SharedState};
 use crate::helpers::extract_token;
 
 pub async fn api_service_create_handler(
@@ -53,4 +53,14 @@ pub async fn api_service_switch_maintance_handler(
     let id = extract_token(&headers)?;
 
     process_switch_maintance_status(&state, id).await
+}
+
+pub async fn api_service_set_callback_url(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<ServiceSetCallbackUrlReq>,
+) -> Result<Json<ServiceSetCallbackUrlRes>, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+
+    process_set_callback_url(&state, token, payload).await
 }

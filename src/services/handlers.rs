@@ -269,7 +269,6 @@ pub async fn process_switch_maintance_status(
 pub async fn process_set_callback_url(
     state: &SharedState,
     token: &str,
-    service_uuid: &str,
     payload: ServiceSetCallbackUrlReq,
 ) -> Result<Json<ServiceSetCallbackUrlRes>, (StatusCode, String)> {
     let mut redis = state.redis.clone();
@@ -282,7 +281,7 @@ pub async fn process_set_callback_url(
         "UPDATE service SET callback_url = $1 WHERE uuid = $2 AND creator_id = $3"
     )
     .bind(&payload.callback_url)
-    .bind(service_uuid)
+    .bind(&payload.service_id)
     .bind(user.id)
     .execute(&state.db)
     .await
@@ -292,7 +291,7 @@ pub async fn process_set_callback_url(
         return Err((StatusCode::FORBIDDEN, "Сервис не найден или нет прав".into()));
     }
 
-    let _: () = redis.del(format!("service:{}", service_uuid)).await.unwrap_or_default();
+    let _: () = redis.del(format!("service:{}", payload.service_id)).await.unwrap_or_default();
 
     Ok(Json(ServiceSetCallbackUrlRes {
         status: "success".into(),
