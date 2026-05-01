@@ -1,38 +1,57 @@
-use axum::{Json, http::{HeaderMap, StatusCode, header}, extract::{State ,ws::{Message, WebSocket, WebSocketUpgrade}}};
-use redis::{aio::ConnectionManager, AsyncCommands};
-use std::{time::{SystemTime, UNIX_EPOCH}};
-use sqlx::postgres::{PgPool};
-use tokio_util::{sync::{CancellationToken}, task::{TaskTracker}};
+use axum::{
+    Json,
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode, header},
+};
+use redis::{AsyncCommands, aio::ConnectionManager};
+use sqlx::postgres::PgPool;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+use crate::SharedState;
 use crate::config;
-use crate::{SharedState};
-use config::{ 
-    get_upgrade_config, GameUser, 
-    SyncResponse, BuyUpgradePayload, 
-    TopUsers, TopUserItem, 
-    TransferReq, TransferRes,
-    WsIncoming, WsOutgoing,
-    Recipient
+use config::{
+    BuyUpgradePayload, GameUser, Recipient, SyncResponse, TopUserItem, TopUsers, TransferReq,
+    TransferRes, WsIncoming, WsOutgoing, get_upgrade_config,
 };
 
 // --- Защита от спама и блокировка токенов ---
-pub async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: &str) -> Result<(), (StatusCode, String)> {
+pub async fn rate_limit_check(
+    redis: &mut redis::aio::ConnectionManager,
+    token: &str,
+) -> Result<(), (StatusCode, String)> {
     let blocked_key = format!("blocked:{}", token);
     let rl_key = format!("rl:{}", token);
 
     let is_blocked: bool = redis.exists(&blocked_key).await.unwrap_or(false);
     if is_blocked {
-        return Err((StatusCode::FORBIDDEN, "Token is blocked for 15 minutes".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Token is blocked for 15 minutes".into(),
+        ));
     }
 
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
 
     let last_req: Option<i64> = redis.get(&rl_key).await.unwrap_or(None);
     if let Some(last) = last_req
-        && now_ms - last < 1500 {
-            let _: () = redis.set_ex(&blocked_key, "1", 900).await.unwrap_or_default();
-            return Err((StatusCode::TOO_MANY_REQUESTS, "Spam detected. Blocked for 15 minutes".into()));
-        }
+        && now_ms - last < 1500
+    {
+        let _: () = redis
+            .set_ex(&blocked_key, "1", 900)
+            .await
+            .unwrap_or_default();
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Spam detected. Blocked for 15 minutes".into(),
+        ));
+    }
 
     let _: () = redis.set_ex(&rl_key, now_ms, 2).await.unwrap_or_default();
     Ok(())
@@ -40,16 +59,17 @@ pub async fn rate_limit_check(redis: &mut redis::aio::ConnectionManager, token: 
 
 // --- Получени пользователя из бд или кеша ---
 pub async fn get_game_user(
-    db: &PgPool, 
-    redis: &mut redis::aio::ConnectionManager, 
-    token: &str
+    db: &PgPool,
+    redis: &mut redis::aio::ConnectionManager,
+    token: &str,
 ) -> Result<Option<GameUser>, (StatusCode, String)> {
     let cache_key = format!("user:{}", token);
 
     if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await
-        && let Ok(user) = serde_json::from_str(&cached_data) {
-            return Ok(Some(user));
-        }
+        && let Ok(user) = serde_json::from_str(&cached_data)
+    {
+        return Ok(Some(user));
+    }
 
     let user = sqlx::query_as::<_, GameUser>(
         r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync FROM "user" WHERE token = $1"#
@@ -67,16 +87,17 @@ pub async fn get_game_user(
 }
 // --- Получени пользователя из бд или кеша по id ---
 pub async fn get_game_user_id(
-    db: &PgPool, 
-    redis: &mut redis::aio::ConnectionManager, 
-    id: i64
+    db: &PgPool,
+    redis: &mut redis::aio::ConnectionManager,
+    id: i64,
 ) -> Result<Option<GameUser>, (StatusCode, String)> {
     let cache_key = format!("user_id:{}", id);
 
     if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(&cache_key).await
-        && let Ok(user) = serde_json::from_str(&cached_data) {
-            return Ok(Some(user));
-        }
+        && let Ok(user) = serde_json::from_str(&cached_data)
+    {
+        return Ok(Some(user));
+    }
 
     let user = sqlx::query_as::<_, GameUser>(
         r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync FROM "user" WHERE id = $1"#
@@ -99,16 +120,19 @@ pub async fn process_clicks_and_sync(
     clicks_data: i64,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     let mut redis = state.redis.clone();
-    
+
     rate_limit_check(&mut redis, token).await?;
 
     let user = get_game_user(&state.db, &mut redis, token)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
 
-    let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    
-    let actual_clicks = clicks_data.min(100); 
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let actual_clicks = clicks_data.min(100);
     let time_diff = (now_sec - user.last_sync).max(0);
 
     let total_earned = (actual_clicks * user.per_click) + (time_diff * user.auto_click);
@@ -122,9 +146,17 @@ pub async fn process_clicks_and_sync(
         .bind(token)
         .execute(&state.db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB Error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB Error: {}", e),
+            )
+        })?;
 
-    let _: () = redis.del(format!("user:{}", token)).await.unwrap_or_default();
+    let _: () = redis
+        .del(format!("user:{}", token))
+        .await
+        .unwrap_or_default();
 
     Ok(Json(SyncResponse {
         balance: final_balance,
@@ -144,14 +176,17 @@ pub async fn process_fetch_data_user(
         return Ok(Json(user));
     }
 
-    let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
     let new_user = sqlx::query_as::<_, GameUser>(
         r#"
         INSERT INTO "user" (token, first_name, per_click, auto_click, balance, last_sync)
         VALUES ($1, 'Player', 1, 0, 0, $2)
         RETURNING id, token, first_name, per_click, auto_click, balance, last_sync
-        "#
+        "#,
     )
     .bind(token)
     .bind(now_sec)
@@ -160,78 +195,100 @@ pub async fn process_fetch_data_user(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let json = serde_json::to_string(&new_user).unwrap();
-    let _: () = redis.set_ex(format!("user:{}", token), json, 60).await.unwrap_or_default();
+    let _: () = redis
+        .set_ex(format!("user:{}", token), json, 60)
+        .await
+        .unwrap_or_default();
 
     Ok(Json(new_user))
 }
 
-// --- Обработка покупки апгрейдов --- 
+// --- Обработка покупки апгрейдов ---
 pub async fn process_buy_upgrade(
     state: &SharedState,
     token: &str,
     payload: BuyUpgradePayload,
 ) -> Result<Json<GameUser>, (StatusCode, String)> {
     let mut redis = state.redis.clone();
-    
+
     let config = get_upgrade_config(&payload.upgrade_id)
         .ok_or((StatusCode::BAD_REQUEST, "Неверный ID апгрейда".into()))?;
 
-    let user = get_game_user(&state.db, &mut redis, token).await?
+    let user = get_game_user(&state.db, &mut redis, token)
+        .await?
         .ok_or((StatusCode::NOT_FOUND, "Пользователь не найден".into()))?;
 
-    let upgrade_row: (i32,) = sqlx::query_as("SELECT level FROM user_upgrades WHERE user_id = $1 AND upgrade_id = $2")
-        .bind(user.id)
-        .bind(config.id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .unwrap_or((0,));
+    let upgrade_row: (i32,) =
+        sqlx::query_as("SELECT level FROM user_upgrades WHERE user_id = $1 AND upgrade_id = $2")
+            .bind(user.id)
+            .bind(config.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .unwrap_or((0,));
 
     let current_level = upgrade_row.0;
 
     let price = (config.base_price as f64 * config.price_growth.powi(current_level)) as i64;
 
-    let mut tx = state.db.begin().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let update_result = sqlx::query(
-            "UPDATE \"user\" SET balance = balance - $1 WHERE id = $2 AND balance >= $1"
-        )
-        .bind(price)
-        .bind(user.id)
-        .execute(&mut *tx)
+    let mut tx = state
+        .db
+        .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let update_result =
+        sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2 AND balance >= $1")
+            .bind(price)
+            .bind(user.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if update_result.rows_affected() == 0 {
         return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
     }
 
-    sqlx::query(r#"
+    sqlx::query(
+        r#"
         INSERT INTO user_upgrades (user_id, upgrade_id, level) 
         VALUES ($1, $2, 1) 
         ON CONFLICT (user_id, upgrade_id) DO UPDATE SET level = user_upgrades.level + 1
-    "#)
+    "#,
+    )
     .bind(user.id)
     .bind(config.id)
-    .execute(&mut *tx).await
+    .execute(&mut *tx)
+    .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let field = if config.upgrade_type == "auto" { "auto_click" } else { "per_click" };
+    let field = if config.upgrade_type == "auto" {
+        "auto_click"
+    } else {
+        "per_click"
+    };
     let update_stat_query = format!("UPDATE \"user\" SET {field} = {field} + $1 WHERE id = $2");
-    
+
     sqlx::query(&update_stat_query)
         .bind(config.base_power)
         .bind(user.id)
-        .execute(&mut *tx).await
+        .execute(&mut *tx)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let _: () = redis.del(format!("user:{}", token)).await.unwrap_or_default();
+    let _: () = redis
+        .del(format!("user:{}", token))
+        .await
+        .unwrap_or_default();
 
-    let updated_user = get_game_user(&state.db, &mut redis, token).await?
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Ошибка синхронизации".into()))?;
+    let updated_user = get_game_user(&state.db, &mut redis, token).await?.ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Ошибка синхронизации".into(),
+    ))?;
 
     Ok(Json(updated_user))
 }
@@ -245,28 +302,37 @@ pub async fn process_get_top_user(
     let cache_key = "top_users_50";
 
     if let Ok(Some(cached_data)) = redis.get::<_, Option<String>>(cache_key).await
-        && let Ok(top_users) = serde_json::from_str::<TopUsers>(&cached_data) {
-            return Ok(Json(top_users));
-        }
+        && let Ok(top_users) = serde_json::from_str::<TopUsers>(&cached_data)
+    {
+        return Ok(Json(top_users));
+    }
 
     let users_from_db = sqlx::query_as::<_, GameUser>(
         r#"SELECT id, token, first_name, per_click, auto_click, balance, last_sync 
            FROM "user" 
            ORDER BY balance DESC 
-           LIMIT $1"#
+           LIMIT $1"#,
     )
     .bind(limit)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB Error: {}", e)))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB Error: {}", e),
+        )
+    })?;
 
-    let top_list = users_from_db.into_iter().map(|u| TopUserItem {
-        id: u.id,
-        first_name: u.first_name,
-        balance: u.balance,
-        per_click: u.per_click,
-        auto_click: u.auto_click,
-    }).collect();
+    let top_list = users_from_db
+        .into_iter()
+        .map(|u| TopUserItem {
+            id: u.id,
+            first_name: u.first_name,
+            balance: u.balance,
+            per_click: u.per_click,
+            auto_click: u.auto_click,
+        })
+        .collect();
 
     let response = TopUsers { users: top_list };
 
@@ -292,32 +358,53 @@ pub async fn process_transfer(
         .await?
         .ok_or((StatusCode::UNAUTHORIZED, "Отправитель не найден".into()))?;
 
-    let mut tx = state.db.begin().await
+    let mut tx = state
+        .db
+        .begin()
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Итоговый баланс после операции — заполним внутри match
+    let new_balance: i64;
 
     match payload.recipient {
         Recipient::User(recipient_id) => {
             if sender.id == recipient_id {
-                return Err((StatusCode::BAD_REQUEST, "Нельзя переводить самому себе".into()));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Нельзя переводить самому себе".into(),
+                ));
             }
 
-            let (id1, id2) = if sender.id < recipient_id { (sender.id, recipient_id) } else { (recipient_id, sender.id) };
-            
+            let (id1, id2) = if sender.id < recipient_id {
+                (sender.id, recipient_id)
+            } else {
+                (recipient_id, sender.id)
+            };
+
             sqlx::query("SELECT id FROM \"user\" WHERE id IN ($1, $2) FOR UPDATE")
                 .bind(id1)
                 .bind(id2)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Lock error: {}", e),
+                    )
+                })?;
 
             let row: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1")
                 .bind(sender.id)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            
+
             let current_balance = row.0;
 
             if current_balance < payload.ammount {
@@ -329,36 +416,55 @@ pub async fn process_transfer(
                 .bind(sender.id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Lock error: {}", e),
+                    )
+                })?;
 
-            let update_res = sqlx::query("UPDATE \"user\" SET balance = balance + $1 WHERE id = $2")
-                .bind(payload.ammount)
-                .bind(recipient_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+            let update_res =
+                sqlx::query("UPDATE \"user\" SET balance = balance + $1 WHERE id = $2")
+                    .bind(payload.ammount)
+                    .bind(recipient_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Lock error: {}", e),
+                        )
+                    })?;
 
             if update_res.rows_affected() == 0 {
                 return Err((StatusCode::NOT_FOUND, "Получатель не найден".into()));
             }
 
-            sqlx::query("INSERT INTO transfer_history (sender_id, recipient_id, amount, created_at) VALUES ($1, $2, $3, $4)")
-                .bind(sender.id)
-                .bind(recipient_id)
-                .bind(payload.ammount)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {}", e)))?;
+            sqlx::query(
+                "INSERT INTO transfer_history (sender_id, recipient_id, amount, created_at) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(sender.id)
+            .bind(recipient_id)
+            .bind(payload.ammount)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Lock error: {}", e),
+                )
+            })?;
+
+            new_balance = current_balance - payload.ammount;
         }
 
         Recipient::Service(service_uuid) => {
             let redis_key = format!("service:{}", service_uuid);
             let cached_data: Option<String> = redis.get(&redis_key).await.unwrap_or(None);
 
-            // Сначала пробуем достать из кэша
             let (creator_id, is_maintenance) = if let Some(data) = cached_data {
-                // Парсим JSON и извлекаем поля, если они там есть
                 let json: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
                 let cid = json.get("creator_id").and_then(|v| v.as_i64());
                 let maint = json.get("maintenance").and_then(|v| v.as_bool());
@@ -366,31 +472,32 @@ pub async fn process_transfer(
                 if let (Some(c), Some(m)) = (cid, maint) {
                     (c, m)
                 } else {
-                    // Если в JSON не оказалось нужных полей (старая версия кэша), идем в БД
                     fetch_service_from_db(&state.db, &service_uuid).await?
                 }
             } else {
-                // Если в Redis вообще ничего нет — идем в БД
                 fetch_service_from_db(&state.db, &service_uuid).await?
             };
 
-            // Проверка на тех. обслуживание
             if is_maintenance && sender.id != creator_id {
-                return Err((StatusCode::FORBIDDEN, "Сервис на тех. обслуживании. Переводы доступны только владельцу".into()));
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Сервис на тех. обслуживании. Переводы доступны только владельцу".into(),
+                ));
             }
 
-            // Блокируем баланс юзера и проверяем средства
-            let row: (i64,) = sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1 FOR UPDATE")
-                .bind(sender.id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let row: (i64,) =
+                sqlx::query_as("SELECT balance FROM \"user\" WHERE id = $1 FOR UPDATE")
+                    .bind(sender.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            if row.0 < payload.ammount {
+            let current_balance = row.0;
+
+            if current_balance < payload.ammount {
                 return Err((StatusCode::PAYMENT_REQUIRED, "Недостаточно средств".into()));
             }
 
-            // Списываем у юзера
             sqlx::query("UPDATE \"user\" SET balance = balance - $1 WHERE id = $2")
                 .bind(payload.ammount)
                 .bind(sender.id)
@@ -398,7 +505,6 @@ pub async fn process_transfer(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            // Зачисляем сервису
             sqlx::query("UPDATE service SET balance = balance + $1 WHERE uuid = $2")
                 .bind(payload.ammount)
                 .bind(&service_uuid)
@@ -406,10 +512,11 @@ pub async fn process_transfer(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            // Запись в историю сервиса
+            // История сервиса
             sqlx::query(
-                "INSERT INTO service_history (service_uuid, amount, user_id, status, created_at, maintenance) 
-                 VALUES ($1, $2, $3, $4, $5, $6)"
+                "INSERT INTO service_history \
+                 (service_uuid, amount, user_id, status, created_at, maintenance) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(&service_uuid)
             .bind(payload.ammount)
@@ -420,19 +527,36 @@ pub async fn process_transfer(
             .execute(&mut *tx)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            sqlx::query(
+                "INSERT INTO transfer_history \
+                 (sender_id, recipient_id, service_uuid, amount, created_at) \
+                 VALUES ($1, NULL, $2, $3, $4)",
+            )
+            .bind(sender.id)
+            .bind(&service_uuid)
+            .bind(payload.ammount)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            new_balance = current_balance - payload.ammount;
         }
     }
 
-    // Фиксация изменений
-    tx.commit().await
+    tx.commit()
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Инвалидация кэша баланса пользователя
-    let _: () = redis.del(format!("user:{}", token)).await.unwrap_or_default();
+    let _: () = redis
+        .del(format!("user:{}", token))
+        .await
+        .unwrap_or_default();
 
     Ok(Json(TransferRes {
         status: "success".into(),
-        new_balance: sender.balance - payload.ammount,
+        new_balance,
     }))
 }
 
@@ -449,52 +573,52 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
 
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Text(text) = msg
-            && let Ok(WsIncoming::Auth { token }) = serde_json::from_str::<WsIncoming>(&text) {
-                
-                let redis_user_key = format!("user:{}", &token);
-                let mut redis_conn = state.redis.clone();
-                
-                let exists_in_cache: bool = redis_conn
-                    .exists(&redis_user_key)
+            && let Ok(WsIncoming::Auth { token }) = serde_json::from_str::<WsIncoming>(&text)
+        {
+            let redis_user_key = format!("user:{}", &token);
+            let mut redis_conn = state.redis.clone();
+
+            let exists_in_cache: bool = redis_conn.exists(&redis_user_key).await.unwrap_or(false);
+
+            let mut is_valid = exists_in_cache;
+
+            if !is_valid {
+                let db_user = sqlx::query("SELECT id FROM \"user\" WHERE token = $1")
+                    .bind(&token)
+                    .fetch_optional(&state.db)
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or(None);
 
-                let mut is_valid = exists_in_cache;
-
-                if !is_valid {
-                    let db_user = sqlx::query("SELECT id FROM \"user\" WHERE token = $1")
-                        .bind(&token) 
-                        .fetch_optional(&state.db)
-                        .await
-                        .unwrap_or(None);
-
-                    if db_user.is_some() {
-                        let _: () = redis_conn
-                            .set_ex(&redis_user_key, "1", 900)
-                            .await
-                            .unwrap_or_default();
-                        is_valid = true;
-                    }
-                }
-
-                if is_valid {
-                    let saved_token = token.clone();
-
+                if db_user.is_some() {
                     let _: () = redis_conn
-                        .set_ex(format!("online:{}", &saved_token), "1", 60)
+                        .set_ex(&redis_user_key, "1", 900)
                         .await
                         .unwrap_or_default();
-
-                    let response = serde_json::to_string(&WsOutgoing::AuthSuccess).unwrap();
-                    let _ = socket.send(Message::Text(response)).await;
-
-                    current_token = Some(saved_token);
-                    break; 
-                } else {
-                    let error = serde_json::to_string(&WsOutgoing::Error { message: "Invalid token".into() }).unwrap();
-                    let _ = socket.send(Message::Text(error)).await;
+                    is_valid = true;
                 }
             }
+
+            if is_valid {
+                let saved_token = token.clone();
+
+                let _: () = redis_conn
+                    .set_ex(format!("online:{}", &saved_token), "1", 60)
+                    .await
+                    .unwrap_or_default();
+
+                let response = serde_json::to_string(&WsOutgoing::AuthSuccess).unwrap();
+                let _ = socket.send(Message::Text(response)).await;
+
+                current_token = Some(saved_token);
+                break;
+            } else {
+                let error = serde_json::to_string(&WsOutgoing::Error {
+                    message: "Invalid token".into(),
+                })
+                .unwrap();
+                let _ = socket.send(Message::Text(error)).await;
+            }
+        }
     }
 
     let Some(token) = current_token else {
@@ -514,7 +638,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
 
                     let pong = serde_json::to_string(&WsOutgoing::Pong).unwrap();
                     if socket.send(Message::Text(pong)).await.is_err() {
-                        break; 
+                        break;
                     }
                 }
             }
@@ -539,17 +663,23 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
         .bind(now)
         .bind(&token)
         .execute(&state.db)
-        .await 
+        .await
     {
         Ok(result) => {
             if result.rows_affected() == 0 {
-                eprintln!("WS Warning: last_sync не обновлен. Пользователь с токеном {} не найден в БД", &token);
+                eprintln!(
+                    "WS Warning: last_sync не обновлен. Пользователь с токеном {} не найден в БД",
+                    &token
+                );
             } else {
                 println!("WS: Состояние юзера {} успешно сохранено", &token);
             }
         }
         Err(e) => {
-            eprintln!("WS Error: Критическая ошибка при сохранении last_sync для {}: {}", &token, e);
+            eprintln!(
+                "WS Error: Критическая ошибка при сохранении last_sync для {}: {}",
+                &token, e
+            );
         }
     }
 }
@@ -559,15 +689,20 @@ pub fn extract_token(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> 
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing Authorization header".to_string()))?;
-    auth.strip_prefix("Bearer ")
-        .ok_or((StatusCode::BAD_REQUEST, "Invalid Authorization header format".to_string()))
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Missing Authorization header".to_string(),
+        ))?;
+    auth.strip_prefix("Bearer ").ok_or((
+        StatusCode::BAD_REQUEST,
+        "Invalid Authorization header format".to_string(),
+    ))
 }
 
 // -- Фоновый процесс периодической синхронизации данных с БД ---
 pub async fn spawn_db_syncer(db: PgPool, mut redis: ConnectionManager, token: CancellationToken) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
-    
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -586,12 +721,16 @@ pub async fn spawn_db_syncer(db: PgPool, mut redis: ConnectionManager, token: Ca
 pub async fn do_sync(db: &PgPool, redis: &mut ConnectionManager) {
     let tokens: Vec<String> = redis.smembers("sync_queue").await.unwrap_or_default();
     for t in tokens {
-        let delta: i64 = redis.getset(format!("pending_balance:{}", t), 0).await.unwrap_or(0);
+        let delta: i64 = redis
+            .getset(format!("pending_balance:{}", t), 0)
+            .await
+            .unwrap_or(0);
         if delta > 0 {
             let _ = sqlx::query(r#"UPDATE "user" SET balance = balance + $1 WHERE token = $2"#)
                 .bind(delta)
                 .bind(&t)
-                .execute(db).await;
+                .execute(db)
+                .await;
         }
         let _: () = redis.srem("sync_queue", &t).await.unwrap_or_default();
     }
@@ -602,20 +741,22 @@ pub async fn shutdown_signal(token: CancellationToken, _tracker: TaskTracker) {
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to listen for ctrl+c");
-    
+
     println!("Получен сигнал остановки (Ctrl+C)...");
     token.cancel();
 }
 
-async fn fetch_service_from_db(db: &sqlx::PgPool, uuid: &str) -> Result<(i64, bool), (StatusCode, String)> {
-    let row: (i64, bool) = sqlx::query_as(
-        "SELECT creator_id, maintenance FROM service WHERE uuid = $1"
-    )
-    .bind(uuid)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .ok_or((StatusCode::NOT_FOUND, "Сервис не найден".into()))?;
+async fn fetch_service_from_db(
+    db: &sqlx::PgPool,
+    uuid: &str,
+) -> Result<(i64, bool), (StatusCode, String)> {
+    let row: (i64, bool) =
+        sqlx::query_as("SELECT creator_id, maintenance FROM service WHERE uuid = $1")
+            .bind(uuid)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "Сервис не найден".into()))?;
 
     Ok(row)
 }
