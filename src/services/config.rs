@@ -61,3 +61,19 @@ pub struct ServiceMaintenanceSwitch {
     pub status: String,
     pub maintenance: bool,
 }
+#[derive(Serialize)]
+pub struct ServiceCallbackPayload {
+    pub from_user_id: i64,
+    pub ammount: i64,
+    pub message: String,
+    pub created_at: i64,
+}
+#[derive(Deserialize)]
+pub struct ServiceSetCallbackUrlReq {
+    pub callback_url: String,
+}
+#[derive(Serialize)]
+pub struct ServiceSetCallbackUrlRes {
+    pub status: String,
+    pub callback_url: String,
+}
