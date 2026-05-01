@@ -17,7 +17,7 @@ use config::{
     BuyUpgradePayload, GameUser, Recipient, SyncResponse, TopUserItem, TopUsers, TransferReq,
     TransferRes, WsIncoming, WsOutgoing, get_upgrade_config,
 };
-
+use crate::services::config::{ServiceCallbackPayload};
 // --- Защита от спама и блокировка токенов ---
 pub async fn rate_limit_check(
     redis: &mut redis::aio::ConnectionManager,
@@ -349,6 +349,7 @@ pub async fn process_transfer(
     payload: TransferReq,
 ) -> Result<Json<TransferRes>, (StatusCode, String)> {
     let mut redis = state.redis.clone();
+    let mut callback_data: Option<(Option<String>, i64, i64, String, i64)> = None;
 
     if payload.ammount <= 0 {
         return Err((StatusCode::BAD_REQUEST, "Сумма должна быть больше 0".into()));
@@ -464,13 +465,14 @@ pub async fn process_transfer(
             let redis_key = format!("service:{}", service_uuid);
             let cached_data: Option<String> = redis.get(&redis_key).await.unwrap_or(None);
 
-            let (creator_id, is_maintenance) = if let Some(data) = cached_data {
+            let (creator_id, is_maintenance, callback_url) = if let Some(data) = cached_data {
                 let json: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
                 let cid = json.get("creator_id").and_then(|v| v.as_i64());
                 let maint = json.get("maintenance").and_then(|v| v.as_bool());
-
+                let cb = json.get("callback_url").and_then(|v| v.as_bool()).map(|s| s.to_string());
+                
                 if let (Some(c), Some(m)) = (cid, maint) {
-                    (c, m)
+                    (c, m, cb)
                 } else {
                     fetch_service_from_db(&state.db, &service_uuid).await?
                 }
@@ -542,6 +544,14 @@ pub async fn process_transfer(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             new_balance = current_balance - payload.ammount;
+
+            callback_data = Some ((
+                    callback_url,
+                    sender.id,
+                    payload.ammount,
+                    payload.message.clone().unwrap_or_default(),
+                    now,
+            ))
         }
     }
 
@@ -553,6 +563,15 @@ pub async fn process_transfer(
         .del(format!("user:{}", token))
         .await
         .unwrap_or_default();
+
+    if let Some((Some(url), from_user_id, amount, message, created_at)) = callback_data {
+        send_service_callback(url, ServiceCallbackPayload {
+            from_user_id,
+            ammount: amount,
+            message,
+            created_at,
+        }).await;
+    }
 
     Ok(Json(TransferRes {
         status: "success".into(),
@@ -749,9 +768,9 @@ pub async fn shutdown_signal(token: CancellationToken, _tracker: TaskTracker) {
 async fn fetch_service_from_db(
     db: &sqlx::PgPool,
     uuid: &str,
-) -> Result<(i64, bool), (StatusCode, String)> {
-    let row: (i64, bool) =
-        sqlx::query_as("SELECT creator_id, maintenance FROM service WHERE uuid = $1")
+) -> Result<(i64, bool, Option<String>), (StatusCode, String)> {
+    let row: (i64, bool, Option<String>) =
+        sqlx::query_as("SELECT creator_id, maintenance, callback_url FROM service WHERE uuid = $1")
             .bind(uuid)
             .fetch_optional(db)
             .await
@@ -759,4 +778,25 @@ async fn fetch_service_from_db(
             .ok_or((StatusCode::NOT_FOUND, "Сервис не найден".into()))?;
 
     Ok(row)
+}
+pub async fn send_service_callback(
+    callback_url: String,
+    payload: ServiceCallbackPayload,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+
+        let client = match client {
+            Ok(c) => c,
+            Err(_) => return
+        };
+
+        let _= client
+            .post(&callback_url)
+            .json(&payload)
+            .send()
+            .await;
+    });
 }

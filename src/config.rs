@@ -239,6 +239,7 @@ pub enum Recipient {
 pub struct TransferReq {
     pub ammount: i64,
     pub recipient: Recipient,
+    pub message: Option<String>,
 }
 #[derive(Serialize)]
 pub struct TransferRes {

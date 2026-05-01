@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::config::{
     ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceMaintenanceSwitch,
-    ServiceTransferToUserReq, ServiceTransferToUserRes,
+    ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceSetCallbackUrlReq,
+    ServiceSetCallbackUrlRes
 };
 use crate::SharedState;
 use crate::helpers::{get_game_user, get_game_user_id};
@@ -263,5 +264,38 @@ pub async fn process_switch_maintance_status(
     Ok(Json(ServiceMaintenanceSwitch {
         status: "success".into(),
         maintenance: service.maintenance,
+    }))
+}
+pub async fn process_set_callback_url(
+    state: &SharedState,
+    token: &str,
+    service_uuid: &str,
+    payload: ServiceSetCallbackUrlReq,
+) -> Result<Json<ServiceSetCallbackUrlRes>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+
+    let user = get_game_user(&state.db, &mut redis, token)
+        .await?
+        .ok_or((StatusCode::UNAUTHORIZED, "Пользователь не найден".into()))?;
+
+    let updated = sqlx::query(
+        "UPDATE service SET callback_url = $1 WHERE uuid = $2 AND creator_id = $3"
+    )
+    .bind(&payload.callback_url)
+    .bind(service_uuid)
+    .bind(user.id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if updated.rows_affected() == 0 {
+        return Err((StatusCode::FORBIDDEN, "Сервис не найден или нет прав".into()));
+    }
+
+    let _: () = redis.del(format!("service:{}", service_uuid)).await.unwrap_or_default();
+
+    Ok(Json(ServiceSetCallbackUrlRes {
+        status: "success".into(),
+        callback_url: payload.callback_url,
     }))
 }
