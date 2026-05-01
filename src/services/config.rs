@@ -71,6 +71,7 @@ pub struct ServiceCallbackPayload {
 #[derive(Deserialize)]
 pub struct ServiceSetCallbackUrlReq {
     pub callback_url: String,
+    pub service_id: String,
 }
 #[derive(Serialize)]
 pub struct ServiceSetCallbackUrlRes {
