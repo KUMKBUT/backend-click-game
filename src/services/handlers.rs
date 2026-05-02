@@ -7,11 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::config::{
     ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceMaintenanceSwitch,
     ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceSetCallbackUrlReq,
-    ServiceSetCallbackUrlRes, ServiceGetHistoryRes
+    ServiceSetCallbackUrlRes, ServiceGetHistoryRes, ServiceGetUserService,
+    ServiceHistoryItem
 };
 use crate::SharedState;
-use crate::helpers::{get_game_user, get_game_user_id};
-use crate::services::config::ServiceHistoryItem;
+use crate::helpers::{get_game_user, get_game_user_id, fetch_service_from_db};
+use crate::config::{GameUser};
 
 // --- Создание сервиса ---
 pub async fn process_create_service(
@@ -161,6 +162,34 @@ pub async fn process_get_history_service(
     }
 
     Ok(Json(response))
+}
+
+pub async fn process_get_user_info_service(
+    state: &SharedState,
+    uuid: &str,
+    id: usize,
+) -> Result<Json<ServiceGetUserService>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+
+    let _ = fetch_service_from_db(&state.db, uuid).await?;
+
+    let user_info = get_game_user_id(&state.db, &mut redis, id as i64)
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "Пользователь не найден.".into()))?;
+    
+    Ok(Json(user_info.into()))
+}
+
+impl From<GameUser> for ServiceGetUserService {
+    fn from(user: GameUser) -> Self {
+        Self {
+            id: user.id,
+            first_name: user.first_name,
+            per_click: user.per_click,
+            auto_click: user.auto_click,
+            balance: user.balance,
+        }
+    }
 }
 
 pub async fn process_transfer_to_user(

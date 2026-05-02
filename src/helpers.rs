@@ -765,7 +765,7 @@ pub async fn shutdown_signal(token: CancellationToken, _tracker: TaskTracker) {
     token.cancel();
 }
 
-async fn fetch_service_from_db(
+pub async fn fetch_service_from_db(
     db: &sqlx::PgPool,
     uuid: &str,
 ) -> Result<(i64, bool, Option<String>), (StatusCode, String)> {
