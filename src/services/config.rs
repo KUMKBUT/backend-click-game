@@ -82,3 +82,11 @@ pub struct ServiceSetCallbackUrlRes {
 pub struct ServiceGetHistoryRes {
     pub history: Vec<ServiceHistoryItem>,
 }
+#[derive(Serialize, Deserialize)]
+pub struct ServiceGetUserService {
+    pub id: i64,
+    pub first_name: String,
+    pub per_click: i64,
+    pub auto_click: i64,
+    pub balance: i64,
+}

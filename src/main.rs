@@ -22,7 +22,7 @@ use helpers::{
 mod services;
 use crate::services::routes::{
     api_service_create_handler, api_service_get_info_handler, api_service_switch_maintance_handler,
-    api_service_transfer_to_user_handler, api_service_set_callback_url, api_service_get_history
+    api_service_transfer_to_user_handler, api_service_set_callback_url, api_service_get_history, api_service_get_user
 };
 pub struct AppState {
     pub db: PgPool,
@@ -76,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/service/maintance", get(api_service_switch_maintance_handler))
         .route("/api/service/callbackUrl", post(api_service_set_callback_url))
         .route("/api/service/get_history/:limit", get(api_service_get_history))
+        .route("/api/service/get_user/:id", get(api_service_get_user))
         .with_state(shared_state);
 
     let addr = "0.0.0.0:3719";
