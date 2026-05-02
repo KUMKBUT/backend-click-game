@@ -38,6 +38,7 @@ CREATE INDEX IF NOT EXISTS idx_transfer_service   ON transfer_history(service_uu
 -- Таблица сервисов
 CREATE TABLE service (
     uuid TEXT PRIMARY KEY,
+    uuid_secret TEXT NOT NULL UNIQUE,
     creator_id BIGINT NOT NULL,
     name TEXT NOT NULL,
     description TEXT DEFAULT '',

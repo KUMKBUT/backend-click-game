@@ -1,4 +1,5 @@
 use axum::{Json, http::StatusCode};
+use uuid::Uuid;
 use redis::AsyncCommands;
 use sqlx::Row;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,10 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::config::{
     ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceMaintenanceSwitch,
     ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceSetCallbackUrlReq,
-    ServiceSetCallbackUrlRes
+    ServiceSetCallbackUrlRes, ServiceGetHistoryRes
 };
 use crate::SharedState;
 use crate::helpers::{get_game_user, get_game_user_id};
+use crate::services::config::ServiceHistoryItem;
 
 // --- Создание сервиса ---
 pub async fn process_create_service(
@@ -35,11 +37,14 @@ pub async fn process_create_service(
         .as_secs() as i64;
 
     let uuid = format!("svc_{}_{}", creator_id.id, now);
+    let uuid_secret = Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO service (creator_id, name, url_img, callback_url, reg_date)
+        "INSERT INTO service (uuid, uuid_secret, creator_id, name, url_img, callback_url, reg_date)
          VALUES ($1, $2, $3, $4, $5)",
     )
+    .bind(&uuid)
+    .bind(&uuid_secret)
     .bind(creator_id.id)
     .bind(&name)
     .bind(&url_img)
@@ -51,9 +56,9 @@ pub async fn process_create_service(
 
     let response = ServiceCreateRes {
         uuid: uuid.clone(),
+        uuid_secret: uuid_secret.clone(),
         first_name: name,
         creator_id: creator_id.id,
-        description: "".to_string(),
         balance: 0,
         callback_url,
         history: vec![],
@@ -107,6 +112,55 @@ pub async fn process_get_info_service(
     }
 
     Ok(Json(service))
+}
+
+pub async fn process_get_history_service(
+    state: &SharedState,
+    uuid: &str,
+    limit: usize,
+) -> Result<Json<ServiceGetHistoryRes>, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+
+    let final_limit = std::cmp::min(limit, 15) as i64;
+
+    let cache_key = format!("service:history:{}:{}", uuid, final_limit);
+
+    if let Ok(Some(cache_data)) = redis.get::<_, Option<String>>(&cache_key).await 
+        && let Ok(response) = serde_json::from_str::<ServiceGetHistoryRes>(&cache_data) 
+    {
+        return Ok(Json(response));
+    }
+    
+
+    let history = sqlx::query_as::<_, ServiceHistoryItem>(
+        r#"
+        SELECT
+            id,
+            service_uuid AS uuid,
+            direction AS status,
+            amount AS ammount,
+            created_at AS date 
+        FROM service_transfer_history
+        WHERE service_uuid = $1
+        ORDER BY created_at DESC
+        LIMIT $2
+        "#
+    )
+    .bind(uuid)
+    .bind(final_limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let response = ServiceGetHistoryRes { history };
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _: () = redis.set_ex(&cache_key, json, 60)
+            .await
+            .unwrap_or_default();
+    }
+
+    Ok(Json(response))
 }
 
 pub async fn process_transfer_to_user(

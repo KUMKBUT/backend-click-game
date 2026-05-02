@@ -1,17 +1,18 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{State, Path},
     http::{HeaderMap, StatusCode},
 };
 
 use super::{
     config::{
         ServiceCreateReq, ServiceCreateRes, ServiceGetInfoRes, ServiceMaintenanceSwitch,
-        ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceCallbackPayload, ServiceSetCallbackUrlReq, ServiceSetCallbackUrlRes
+        ServiceTransferToUserReq, ServiceTransferToUserRes, ServiceSetCallbackUrlReq,
+        ServiceSetCallbackUrlRes, ServiceGetHistoryRes
     },
     handlers::{
         process_create_service, process_get_info_service, process_switch_maintance_status,
-        process_transfer_to_user, process_set_callback_url
+        process_transfer_to_user, process_set_callback_url, process_get_history_service
     },
 };
 use crate::{SharedState};
@@ -63,4 +64,19 @@ pub async fn api_service_set_callback_url(
     let token = extract_token(&headers)?;
 
     process_set_callback_url(&state, token, payload).await
+}
+
+pub async fn api_service_get_history(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(limit_param): Path<String>,
+) -> Result<Json<ServiceGetHistoryRes>, (StatusCode, String)> {
+    let uuid = extract_token(&headers)?;
+
+    let limit = limit_param
+        .trim_start_matches(':') 
+        .parse::<usize>()
+        .unwrap_or(15);
+
+    process_get_history_service(&state, uuid, limit).await
 }
