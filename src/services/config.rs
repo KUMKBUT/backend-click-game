@@ -21,7 +21,6 @@ pub struct ServiceCreateRes {
     pub uuid: String,
     pub first_name: String,
     pub creator_id: i64,
-    pub description: String,
     pub balance: i64,
     pub callback_url: String,
     pub url_img: String,
@@ -29,6 +28,7 @@ pub struct ServiceCreateRes {
     pub maintenance: bool,
     #[sqlx(skip)]
     pub history: Vec<ServiceHistoryItem>,
+    pub uuid_secret: String,
 }
 #[derive(Deserialize)]
 pub struct ServiceCreateReq {
@@ -77,4 +77,8 @@ pub struct ServiceSetCallbackUrlReq {
 pub struct ServiceSetCallbackUrlRes {
     pub status: String,
     pub callback_url: String,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ServiceGetHistoryRes {
+    pub history: Vec<ServiceHistoryItem>,
 }
