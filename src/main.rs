@@ -16,13 +16,18 @@ use config::{
 };
 use helpers::{
     extract_token, process_buy_upgrade, process_clicks_and_sync, process_fetch_data_user,
-    process_get_top_user, process_transfer, shutdown_signal, spawn_db_syncer, ws_handler,
+    process_get_top_user, process_transfer, shutdown_signal, spawn_db_syncer
 };
 
 mod services;
 use crate::services::routes::{
     api_service_create_handler, api_service_get_info_handler, api_service_switch_maintance_handler,
     api_service_transfer_to_user_handler, api_service_set_callback_url, api_service_get_history, api_service_get_user
+};
+
+mod ws;
+use crate::ws::main::{
+    ws_handler,
 };
 pub struct AppState {
     pub db: PgPool,
