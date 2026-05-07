@@ -8,8 +8,8 @@ pub struct RafflePlayer {
 }
 #[derive(Serialize, Deserialize)]
 pub struct RaffleRoomWin {
-    pub time: i32,
     pub bets: Vec<RafflePlayer>,
+    pub winning_amount: i64,
     pub winning_ticket: i64,
     pub winner_id: i64,
     pub winner_first_name: String,
@@ -18,6 +18,7 @@ pub struct RaffleRoomWin {
 pub struct RaffleRoom {
     pub time: i32,
     pub bets: Vec<RafflePlayer>,
+    pub total_bank: i64,
 }
 
 #[derive(Deserialize)]
