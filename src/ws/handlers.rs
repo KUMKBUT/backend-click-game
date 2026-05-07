@@ -5,11 +5,12 @@ use axum::{
     extract::State,
     http::StatusCode,
 };
+use rand::Rng;
 use uuid::Uuid;
 use redis::AsyncCommands;
 
 use crate::SharedState;
-use crate::ws::config::{RafflePlayer, RaffleRoom};
+use crate::ws::config::{RafflePlayer, RaffleRoom, RaffleRoomWin};
 
 pub async fn fetch_raffle_room(
     redis: &mut redis::aio::ConnectionManager,
@@ -32,14 +33,21 @@ pub async fn fetch_raffle_room(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let players = bets
-        .into_iter()
-        .filter_map(|(_, key)| serde_json::from_str::<RafflePlayer>(&key).ok())
+    let players: Vec<RafflePlayer> = bets
+        .values()
+        .filter_map(|v| serde_json::from_str(v).ok())
         .collect();
+
+    let total_bank: i64 = players
+        .iter()
+        .map(|p| p.total_amount)
+        .sum();
+
 
     Ok(RaffleRoom {
         time,
         bets: players,
+        total_bank
     })
 }
 
@@ -122,8 +130,8 @@ pub async fn bet_raffle(
        WHERE id = $2 AND balance >= $1
        "#
     )
-    .bind(&amount)
-    .bind(&user_id)
+    .bind(amount)
+    .bind(user_id)
     .execute(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -145,4 +153,90 @@ pub async fn bet_raffle(
     let room_state = fetch_raffle_room(&mut redis, uuid).await?;
     
     Ok(Json(room_state))
+}
+
+pub async fn internal_finish_raffle(
+    state: SharedState,
+    uuid: String,
+) -> Result<RaffleRoomWin, (StatusCode, String)> {
+    let mut redis = state.redis.clone();
+
+    let cache_bet_key = format!("raffle:{}:bets", uuid);
+    let cache_room_key = format!("raffle:{}", uuid);
+
+    let _: String = redis
+        .hget(&cache_room_key, "time")
+        .await
+        .map_err(|_|(StatusCode::INTERNAL_SERVER_ERROR, "Raffle room not found".to_string()))?;
+    
+    let bets: HashMap<String, String> = redis
+        .hgetall(&cache_bet_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if bets.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Raffle room not found".to_string()));
+    }
+
+    let players: Vec<RafflePlayer> = bets
+        .values()
+        .filter_map(|v| serde_json::from_str(v).ok())
+        .collect();
+
+    let total_bank: i64 = players
+        .iter()
+        .map(|p| p.total_amount)
+        .sum();
+
+    let winning_ticket = rand::thread_rng().gen_range(1..=total_bank);
+
+    let mut current_sum = 0;
+    let mut winner = None;
+
+    for player in &players {
+        current_sum += player.total_amount;
+        if current_sum >= winning_ticket {
+            winner = Some(player);
+            break;
+        }
+    }
+
+    let winner = winner
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Winner calculation failed".to_string()))?;
+
+    let commission = (total_bank + 39) / 40;
+    let final_prize = total_bank.saturating_sub(commission);
+
+    sqlx::query(
+        r#"
+        UPDATE "user" SET balance = balance + $1 WHERE id = $2
+        "#
+    )
+    .bind(final_prize)
+    .bind(winner.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let _: () = redis.del(&[&cache_bet_key, &cache_room_key])
+        .await
+        .ok()
+        .unwrap_or(());
+
+    Ok(RaffleRoomWin { 
+        bets: players.clone(), 
+        winning_ticket,
+        winning_amount: final_prize,
+        winner_id: winner.user_id, 
+        winner_first_name: winner.first_name.clone(),
+    })
+}
+
+pub async fn finish_raffle_game(
+    State(state): State<SharedState>,
+    uuid: &str,
+) -> Result<Json<RaffleRoomWin>, (StatusCode, String)> {
+   let res = internal_finish_raffle(state, uuid.to_string()).await?;
+
+   Ok(Json(res))
 }
