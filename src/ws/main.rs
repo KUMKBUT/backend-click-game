@@ -7,9 +7,7 @@ use serde_json;
 
 use crate::SharedState;
 use crate::helpers::{get_game_user};
-use crate::config::{GameUser};
 use crate::ws::config::{WsIncoming, WsOutgoing};
-use crate::ws::handlers::{fetch_raffle_room, bet_raffle};
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -29,7 +27,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
             let mut redis_conn = state.redis.clone();
 
             match get_game_user(&state.db, &mut redis_conn, &token).await {
-                Ok(Some(user)) => {
+                Ok(_) => {
                     let _: () = redis_conn
                         .set_ex(format!("online:{}", &token), "1", 60)
                         .await
