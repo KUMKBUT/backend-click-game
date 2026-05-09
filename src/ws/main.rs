@@ -54,7 +54,45 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
         return;
     };
 
-    
+    let mut raffle_rx: Option<tokio::sync::broadcast::Receiver<String>> = None;
+
+    loop {
+        if let Some(ref mut rx) = raffle_rx {
+            tokio::select! {
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if !handle_message(&text, &token, &state, &mut socket, &mut raffle_rx).await{
+                                break;
+                            }
+                        }
+                        None | Some(Err(_)) => break,
+                        _ => {}
+                    }
+                }
+
+                broadcast = rx.recv() => {
+                    match broadcast {
+                        Ok(msg_str) => {
+                            let _ = socket.send(Message::Text(msg_str)).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        } else {
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => {
+                    if !handle_message(&text, &token, &state,&mut socket,&mut raffle_rx).await{
+                        break;
+                    }
+                }
+                None | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    }
 
     // --- Cleanup on disconnect ---
     let now = SystemTime::now()
@@ -78,7 +116,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
         Ok(result) => {
             if result.rows_affected() == 0 {
                 eprintln!(
-                    "WS Warning: last_sync не обновлен. Пользователь с токеном {} не найден в БД",
+                    "WS Warning:last_sync не обновлен.Пользователь с токеном {} не найден в БД",
                     &token
                 );
             } else {
@@ -92,4 +130,44 @@ pub async fn handle_socket(mut socket: WebSocket, state: SharedState) {
             );
         }
     }
+}
+
+async fn handle_message(
+    text: &str,
+    token: &str,
+    state: &SharedState,
+    socket: &mut WebSocket,
+    raffle_rx: &mut Option<tokio::sync::broadcast::Receiver<String>>,
+) -> bool {
+    match serde_json::from_str::<WsIncoming>(text) {
+        Ok(WsIncoming::Ping) => {
+            let response = serde_json::to_string(&WsOutgoing::Pong).unwrap();
+            let _ = socket.send(Message::Text(response)).await;
+        }
+
+        Ok(WsIncoming::RaffleJoin) => {
+            *raffle_rx = Some(state.raffle_tx.subscribe());
+
+            let response = serde_json::to_string(&WsOutgoing::RaffleJoinSuccess {
+                players: vec![],
+            }).unwrap();
+            let _ = socket.send(Message::Text(response)).await;
+        }
+
+        Ok(WsIncoming::RaffleExit) => {
+            *raffle_rx = None;
+        }
+
+        Ok(WsIncoming::RaffleBet { ammount, uuid }) => {
+            let _ = (ammount, uuid); // заглушка
+        }
+
+        _ => {
+            let error = serde_json::to_string(&WsOutgoing::Error {
+                message: "Invalid request".into(),
+            }).unwrap();
+            let _ = socket.send(Message::Text(error)).await;
+        }
+    }
+    true
 }

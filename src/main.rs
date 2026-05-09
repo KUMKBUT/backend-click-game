@@ -8,6 +8,7 @@ use redis::aio::ConnectionManager;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::sync::Arc;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::sync::broadcast;
 
 mod config;
 mod helpers;
@@ -32,6 +33,7 @@ use crate::ws::main::{
 pub struct AppState {
     pub db: PgPool,
     pub redis: ConnectionManager,
+    pub raffle_tx: broadcast::Sender<String>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -53,9 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tracker = TaskTracker::new();
     let token = CancellationToken::new();
 
+    let (raffle_tx, _) = broadcast::channel::<String>(64);
+
     let shared_state = Arc::new(AppState {
         db: pool.clone(),
         redis: redis_manager.clone(),
+        raffle_tx,
     });
 
     let sync_db = pool.clone();
