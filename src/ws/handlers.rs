@@ -12,7 +12,7 @@ use uuid::Uuid;
 use redis::AsyncCommands;
 
 use crate::SharedState;
-use crate::ws::config::{RafflePlayer, RaffleRoom, RaffleRoomWin};
+use crate::ws::config::{RafflePlayer, RaffleRoom, RaffleRoomWin, WsOutgoing};
 
 pub async fn fetch_raffle_room(
     redis: &mut redis::aio::ConnectionManager,
@@ -53,31 +53,29 @@ pub async fn fetch_raffle_room(
     })
 }
 
-pub async fn set_new_raffle_room(
-    State(state): State<SharedState>,
-) -> Result<Json<RaffleRoom>, (StatusCode, String)> {
+pub async fn create_raffle_room_internal(
+    state: &SharedState,
+) -> Result<String, (StatusCode, String)> {
     let mut redis = state.redis.clone();
     let id = Uuid::new_v4().to_string();
-    
+
     let cache_room_key = format!("raffle:{}", id);
 
     let fields = [
-        ("time", "30"), 
+        ("time", "30"),
         ("winning_id", "0"),
         ("winning_name", "Name"),
-        ("winning_amount", "0")
+        ("winning_amount", "0"),
     ];
 
     let _: () = redis
         .hset_multiple(&cache_room_key, &fields)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
-    let _: () = redis.expire(&cache_room_key, 60).await.ok().unwrap_or(());
-    
-    let room_state = fetch_raffle_room(&mut redis, &id).await?;
 
-    Ok(Json(room_state))
+    let _: () = redis.expire(&cache_room_key, 60).await.ok().unwrap_or(());
+
+    Ok(id)
 }
 
 pub async fn get_all_raffle_players(
@@ -221,6 +219,16 @@ pub async fn internal_finish_raffle(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let finishged_msg = serde_json::to_string(&WsOutgoing::RaffleFinished { 
+        winner_id: winner.user_id, 
+        winner_first_name: winner.first_name.clone(),  
+        win_amount: final_prize, 
+        winning_ticket,
+    })
+    .unwrap_or_default();
+
+    let _ = state.raffle_tx.send(finishged_msg);
+
     let _: () = redis
         .del(&[&cache_bet_key, &cache_room_key, &lock_key])
         .await
@@ -234,6 +242,76 @@ pub async fn internal_finish_raffle(
         winner_id: winner.user_id,
         winner_first_name: winner.first_name.clone(),
     })
+}
+
+pub fn spawn_raffle_loop(state: SharedState) {
+    tokio::spawn(async move {
+        loop {
+            let uuid = match create_raffle_room_internal(&state).await {
+                Ok(id) => id,
+                Err(e) => {
+                    eprint!("Raffle loop: error a create room: {}", e.1);
+
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            run_raffle_round(state.clone(), uuid).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+pub async fn run_raffle_round(
+    state: SharedState,
+    uuid: String,
+) {
+    let mut redis = state.redis.clone();
+    let cache_room_key = format!("raffle:{}", uuid);
+
+    let mut timer = interval(Duration::from_secs(1));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        timer.tick().await;
+
+        let exists: bool = redis.exists(&cache_room_key).await.unwrap_or(false);
+        if !exists {
+            println!("Raffle loop: room {} closed", uuid);
+            break;
+        }
+
+        let current_time: i32 = match redis.hincr(&cache_room_key, "time", -1).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Raffle loop: error Redis in timer {}: {}", uuid, e);
+                break;
+            }
+        };
+
+        let time_msg = serde_json::to_string(&WsOutgoing::RaffleTime { 
+            seconds_left: current_time, 
+        })
+        .unwrap_or_default();
+        let _ = state.raffle_tx.send(time_msg);
+
+        if current_time <= 0 {
+            match internal_finish_raffle(state.clone(), uuid.clone()).await {
+                Ok(win) => {
+                    println!(
+                        "Raffle loop: winner {} - {} (amount: {})",
+                        uuid, win.winner_first_name, win.winning_amount
+                    );
+                }
+                Err(e) if !matches!(e.0, StatusCode::CONFLICT) => {
+                    eprintln!("Raffle loop: error finished {}: {}", uuid, e.1);
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
 }
 
 pub fn spawn_raffle_timer(state: SharedState, uuid: String) {

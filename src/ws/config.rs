@@ -36,6 +36,7 @@ pub enum WsIncoming {
     #[serde(rename = "raffle_bet")]
     RaffleBet {
         ammount: i64,
+        uuid: String,
     },
     #[serde(rename = "raffle_exit")]
     RaffleExit,
@@ -74,7 +75,6 @@ pub enum WsOutgoing {
     RaffleFinished {
         winner_id: i64,
         winner_first_name: String,
-        winner_img: String,
         win_amount: i64,
         winning_ticket: i64,
     },
