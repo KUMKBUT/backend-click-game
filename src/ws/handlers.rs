@@ -314,49 +314,6 @@ pub async fn run_raffle_round(
     }
 }
 
-pub fn spawn_raffle_timer(state: SharedState, uuid: String) {
-    tokio::spawn(async move {
-        let mut redis = state.redis.clone();
-        let cache_room_key = format!("raffle:{}", uuid);
-
-        let mut timer = interval(Duration::from_secs(1));
-        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            timer.tick().await;
-
-            let exists: bool = redis
-                .exists(&cache_room_key)
-                .await
-                .unwrap_or(false);
-
-            if !exists {
-                println!("Комната {} уже закрыта, останавливаем таймер", uuid);
-                break;
-            }
-
-            let current_time: i32 = match redis.hincr(&cache_room_key, "time", -1).await {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Ошибка Redis в таймере {}: {}", uuid, e);
-                    break;
-                }
-            };
-
-            if current_time <= 0 {
-                println!("Время в комнате {} истекло", uuid);
-                match internal_finish_raffle(state.clone(), uuid.clone()).await {
-                    Err(e) if !matches!(e.0, StatusCode::CONFLICT) => {
-                        eprintln!("Ошибка завершения раффла {}: {}", uuid, e.1);
-                    }
-                    _ => {}
-                }
-                break;
-            }
-        }
-    });
-}
-
 pub async fn finish_raffle_game(
     State(state): State<SharedState>,
     uuid: &str,
